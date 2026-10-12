@@ -1,6 +1,7 @@
 import { EnhancedMode, PermissionMode } from "./loop";
-import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, type SDKCommandLifecycleMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
 import { claudeCheckSession } from "./utils/claudeCheckSession";
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { logger } from "@/lib";
@@ -39,7 +40,13 @@ export async function claudeRemote(opts: {
     onMessage: (message: SDKMessage) => void,
     onFirstResult?: (initialMessage: string) => void,
     onCompletionEvent?: (message: string) => void,
-    onSessionReset?: () => void
+    onSessionReset?: () => void,
+    /**
+     * Called with a steer function while a turn is running, and with null once
+     * it is not. The steer function writes a prompt into the running turn and
+     * returns false if that is no longer possible.
+     */
+    onSteerableChange?: (steer: ((message: string) => boolean) | null) => void
 }) {
     const debugPrefix = '[claudeRemote][async-debug]';
 
@@ -106,6 +113,46 @@ export async function claudeRemote(opts: {
 
     const messages = new PushableAsyncIterable<SDKUserMessage>();
 
+    // Mid-turn steering. Every prompt carries a uuid so Claude reports its
+    // command_lifecycle. A prompt written while a turn runs is absorbed at the
+    // next tool boundary, or, if the turn ends first, Claude runs it as a
+    // follow-up turn on its own -- so a result that leaves a steer unstarted
+    // is not the end of the work.
+    let turnActive = false;
+    let lifecycleReported = false;
+    const unstartedSteers = new Set<string>();
+    // Steers a result already waited on. If one is still unstarted at the next
+    // result, the lifecycle report went missing; stop waiting for it.
+    let deferredSteers = new Set<string>();
+
+    const pushUserMessage = (content: string): string => {
+        const uuid = randomUUID();
+        messages.push({ type: 'user', uuid, message: { role: 'user', content } });
+        return uuid;
+    };
+
+    const steer = (content: string): boolean => {
+        if (!turnActive || opts.signal?.aborted) {
+            return false;
+        }
+        try {
+            unstartedSteers.add(pushUserMessage(content));
+        } catch (e) {
+            logger.debug(`${debugPrefix} steer push failed`, e);
+            return false;
+        }
+        logger.debug(`${debugPrefix} steer pushed (unstarted=${unstartedSteers.size})`);
+        return true;
+    };
+
+    const setTurnActive = (active: boolean) => {
+        if (turnActive === active) {
+            return;
+        }
+        turnActive = active;
+        opts.onSteerableChange?.(active ? steer : null);
+    };
+
     const applyInitialTurn = async (): Promise<{ message: string; mode: EnhancedMode } | null> => {
         let next: { message: string; mode: EnhancedMode } | null;
         try {
@@ -145,13 +192,9 @@ export async function claudeRemote(opts: {
         }
 
         mode = next.mode;
-        messages.push({
-            type: 'user',
-            message: {
-                role: 'user',
-                content: next.message,
-            },
-        });
+        pushUserMessage(next.message);
+        // A prompt cannot join a compaction.
+        setTurnActive(!isCompactCommand);
         return next;
     };
 
@@ -256,7 +299,8 @@ export async function claudeRemote(opts: {
                     return;
                 }
                 mode = next.mode;
-                messages.push({ type: 'user', message: { role: 'user', content: next.message } });
+                pushUserMessage(next.message);
+                setTurnActive(true);
                 logger.debug(
                     `${debugPrefix} nextMessage resolved fetchId=${fetchId} elapsedMs=${Date.now() - startedAt} ` +
                     `messageLength=${next.message.length} permissionMode=${next.mode.permissionMode}`
@@ -356,18 +400,41 @@ export async function claudeRemote(opts: {
                 }
             }
 
+            if (message.type === 'command_lifecycle') {
+                const lifecycle = message as SDKCommandLifecycleMessage;
+                lifecycleReported = true;
+                if (lifecycle.state !== 'queued') {
+                    unstartedSteers.delete(lifecycle.command_uuid);
+                }
+            }
+
             // Handle result messages
             if (message.type === 'result') {
                 resultSeq += 1;
+
+                if (resultSeq === 1 && specialCommand.type === null && initial) {
+                    opts.onFirstResult?.(initial.message);
+                }
+
+                for (const id of deferredSteers) {
+                    unstartedSteers.delete(id);
+                }
+                if (lifecycleReported && unstartedSteers.size > 0) {
+                    deferredSteers = new Set(unstartedSteers);
+                    logger.debug(
+                        `${debugPrefix} result #${resultSeq} received; waiting for the follow-up turn ` +
+                        `(unstartedSteers=${unstartedSteers.size})`
+                    );
+                    continue;
+                }
+                deferredSteers.clear();
+
+                setTurnActive(false);
                 updateThinking(false);
                 logger.debug(
                     `${debugPrefix} result #${resultSeq} received; scheduling next user message ` +
                     `(nextInFlight=${nextMessageFetchInFlight}, inputEnded=${inputEnded})`
                 );
-
-                if (resultSeq === 1 && specialCommand.type === null && initial) {
-                    opts.onFirstResult?.(initial.message);
-                }
 
                 let completionEvent: string | undefined;
                 if (isCompactCommand) {
@@ -417,6 +484,7 @@ export async function claudeRemote(opts: {
             `${debugPrefix} finally ` +
             `(streamMessages=${streamMessageSeq}, results=${resultSeq}, nextFetches=${nextMessageFetchSeq}, inputEnded=${inputEnded})`
         );
+        setTurnActive(false);
         updateThinking(false);
     }
 }
