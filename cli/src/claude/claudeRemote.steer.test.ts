@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as claudeSdk from '@/claude/sdk';
 import type { SDKMessage, SDKUserMessage } from '@/claude/sdk/types';
 import { PushableAsyncIterable } from '@/utils/PushableAsyncIterable';
-import { claudeRemote } from './claudeRemote';
+import { claudeRemote, type SteerFunction } from './claudeRemote';
 
 vi.mock('@/claude/utils/claudeCheckSession', () => ({
     claudeCheckSession: () => true
@@ -17,7 +17,6 @@ vi.mock('@/claude/sdk/utils', () => ({
 }));
 
 type Mode = { permissionMode: 'default' };
-type Steer = (message: string) => boolean;
 
 const result = {
     type: 'result',
@@ -62,7 +61,9 @@ function startFakeClaude(initialMessage: string) {
     const readyEvents: number[] = [];
     const thinking: boolean[] = [];
     const steerable: boolean[] = [];
-    let steer: Steer | null = null;
+    // Outcome of each steer, in the order they were reported.
+    const outcomes: string[] = [];
+    let steer: SteerFunction | null = null;
 
     const run = claudeRemote({
         sessionId: 'session-1',
@@ -97,7 +98,13 @@ function startFakeClaude(initialMessage: string) {
         readyEvents,
         thinking,
         steerable,
+        outcomes,
         getSteer: () => steer,
+        /** Steer through the current steer function, recording its outcome. */
+        steer: (message: string, steerFn: SteerFunction | null = steer) => steerFn?.(message, {
+            onStarted: () => { outcomes.push(`started:${message}`); },
+            onDropped: () => { outcomes.push(`dropped:${message}`); }
+        }) ?? false,
         emit: (message: SDKMessage) => output.push(message),
         /** Emit messages and let claudeRemote process them. */
         async play(...messages: SDKMessage[]) {
@@ -112,6 +119,12 @@ function startFakeClaude(initialMessage: string) {
             output.end();
             await run;
             querySpy.mockRestore();
+        },
+        /** The Claude process fails mid-turn. */
+        async crash() {
+            output.setError(new Error('Claude exited'));
+            await expect(run).rejects.toThrow('Claude exited');
+            querySpy.mockRestore();
         }
     };
 }
@@ -120,24 +133,34 @@ afterEach(() => {
     vi.restoreAllMocks();
 });
 
-describe('claudeRemote mid-turn steering', () => {
-    it('writes a steer into the running turn and ends the turn on its result', async () => {
-        const claude = startFakeClaude('Run the three steps');
-        await waitFor(() => claude.prompts.length === 1);
-        const initialUuid = claude.prompts[0].uuid;
-        expect(initialUuid).toBeTruthy();
-        await claude.play(lifecycle(initialUuid, 'queued'), lifecycle(initialUuid, 'started'));
+/** A fake Claude whose initial prompt has started, so lifecycle reports are on. */
+async function startRunningTurn(initialMessage: string) {
+    const claude = startFakeClaude(initialMessage);
+    await waitFor(() => claude.prompts.length === 1);
+    const initialUuid = claude.prompts[0].uuid;
+    expect(initialUuid).toBeTruthy();
+    await claude.play(lifecycle(initialUuid, 'queued'), lifecycle(initialUuid, 'started'));
+    return { claude, initialUuid };
+}
 
-        expect(claude.getSteer()?.('Skip step three')).toBe(true);
+describe('claudeRemote mid-turn steering', () => {
+    it('writes a steer into the running turn and reports it once Claude takes it', async () => {
+        const { claude, initialUuid } = await startRunningTurn('Run the three steps');
+
+        expect(claude.steer('Skip step three')).toBe(true);
         await waitFor(() => claude.prompts.length === 2);
         const steerPrompt = claude.prompts[1];
         expect(steerPrompt.message.content).toBe('Skip step three');
         expect(steerPrompt.uuid).toBeTruthy();
         expect(steerPrompt.uuid).not.toBe(initialUuid);
 
-        // Absorbed at the next tool boundary, before the turn's result.
-        await claude.play(lifecycle(steerPrompt.uuid, 'queued'), lifecycle(steerPrompt.uuid, 'started'), result);
+        await claude.play(lifecycle(steerPrompt.uuid, 'queued'));
+        expect(claude.outcomes).toEqual([]);
 
+        // Absorbed at the next tool boundary, before the turn's result.
+        await claude.play(lifecycle(steerPrompt.uuid, 'started'), result);
+
+        expect(claude.outcomes).toEqual(['started:Skip step three']);
         expect(claude.readyEvents).toHaveLength(1);
         expect(claude.thinking.at(-1)).toBe(false);
         expect(claude.steerable).toEqual([true, false]);
@@ -147,13 +170,10 @@ describe('claudeRemote mid-turn steering', () => {
     });
 
     it('stays busy through the follow-up turn when the steer arrives after the last tool call', async () => {
-        const claude = startFakeClaude('Write an essay');
-        await waitFor(() => claude.prompts.length === 1);
-        const initialUuid = claude.prompts[0].uuid;
-        await claude.play(lifecycle(initialUuid, 'queued'), lifecycle(initialUuid, 'started'));
+        const { claude, initialUuid } = await startRunningTurn('Write an essay');
 
         const steer = claude.getSteer();
-        expect(steer?.('Add a sentence about coffee')).toBe(true);
+        expect(claude.steer('Add a sentence about coffee')).toBe(true);
         await waitFor(() => claude.prompts.length === 2);
         const steerUuid = claude.prompts[1].uuid;
 
@@ -162,8 +182,10 @@ describe('claudeRemote mid-turn steering', () => {
         expect(claude.readyEvents).toHaveLength(0);
         expect(claude.thinking).not.toContain(false);
         expect(claude.getSteer()).toBe(steer);
+        expect(claude.outcomes).toEqual([]);
 
         await claude.play(lifecycle(steerUuid, 'started'), result);
+        expect(claude.outcomes).toEqual(['started:Add a sentence about coffee']);
         expect(claude.readyEvents).toHaveLength(1);
         expect(claude.thinking.at(-1)).toBe(false);
         expect(claude.getSteer()).toBeNull();
@@ -171,11 +193,72 @@ describe('claudeRemote mid-turn steering', () => {
         await claude.finish();
     });
 
-    it('ends the turn on its result when Claude reports no command lifecycle', async () => {
+    it('stays busy until every queued steer has run in its own follow-up turn', async () => {
+        const { claude } = await startRunningTurn('Write an essay');
+
+        expect(claude.steer('First follow-up')).toBe(true);
+        expect(claude.steer('Second follow-up')).toBe(true);
+        await waitFor(() => claude.prompts.length === 3);
+        const [firstUuid, secondUuid] = [claude.prompts[1].uuid, claude.prompts[2].uuid];
+        await claude.play(lifecycle(firstUuid, 'queued'), lifecycle(secondUuid, 'queued'), result);
+        expect(claude.readyEvents).toHaveLength(0);
+
+        // Claude runs the first one; the second is still queued behind it.
+        await claude.play(lifecycle(firstUuid, 'started'), result, lifecycle(firstUuid, 'completed'));
+        expect(claude.outcomes).toEqual(['started:First follow-up']);
+        expect(claude.readyEvents).toHaveLength(0);
+        expect(claude.thinking).not.toContain(false);
+
+        // Two results later, a steer Claude still reports as queued is waited on.
+        await claude.play(result);
+        expect(claude.readyEvents).toHaveLength(0);
+
+        await claude.play(lifecycle(secondUuid, 'started'), result);
+        expect(claude.outcomes).toEqual(['started:First follow-up', 'started:Second follow-up']);
+        expect(claude.readyEvents).toHaveLength(1);
+        expect(claude.getSteer()).toBeNull();
+
+        await claude.finish();
+    });
+
+    it('reports a steer Claude cancels before it starts as dropped', async () => {
+        const { claude } = await startRunningTurn('Write an essay');
+
+        expect(claude.steer('Never mind')).toBe(true);
+        await waitFor(() => claude.prompts.length === 2);
+        await claude.play(lifecycle(claude.prompts[1].uuid, 'queued'), lifecycle(claude.prompts[1].uuid, 'cancelled'));
+        expect(claude.outcomes).toEqual(['dropped:Never mind']);
+
+        await claude.play(result);
+        expect(claude.readyEvents).toHaveLength(1);
+
+        await claude.finish();
+    });
+
+    it('reports unstarted steers as dropped when the Claude process fails', async () => {
+        const { claude } = await startRunningTurn('Write an essay');
+
+        expect(claude.steer('Taken')).toBe(true);
+        expect(claude.steer('Still queued')).toBe(true);
+        await waitFor(() => claude.prompts.length === 3);
+        await claude.play(
+            lifecycle(claude.prompts[1].uuid, 'queued'),
+            lifecycle(claude.prompts[1].uuid, 'started'),
+            lifecycle(claude.prompts[2].uuid, 'queued')
+        );
+
+        await claude.crash();
+
+        expect(claude.outcomes).toEqual(['started:Taken', 'dropped:Still queued']);
+        expect(claude.getSteer()).toBeNull();
+    });
+
+    it('treats a steer as taken at once when Claude reports no command lifecycle', async () => {
         const claude = startFakeClaude('Run the three steps');
         await waitFor(() => claude.prompts.length === 1);
 
-        expect(claude.getSteer()?.('Skip step three')).toBe(true);
+        expect(claude.steer('Skip step three')).toBe(true);
+        expect(claude.outcomes).toEqual(['started:Skip step three']);
         await claude.play(result);
 
         expect(claude.readyEvents).toHaveLength(1);
@@ -184,18 +267,16 @@ describe('claudeRemote mid-turn steering', () => {
         await claude.finish();
     });
 
-    it('waits for an unstarted steer through one result only', async () => {
-        const claude = startFakeClaude('Write an essay');
-        await waitFor(() => claude.prompts.length === 1);
-        const initialUuid = claude.prompts[0].uuid;
-        await claude.play(lifecycle(initialUuid, 'queued'), lifecycle(initialUuid, 'started'));
+    it('waits for a steer Claude never reports through one result only', async () => {
+        const { claude } = await startRunningTurn('Write an essay');
 
-        expect(claude.getSteer()?.('Add a sentence about coffee')).toBe(true);
+        expect(claude.steer('Add a sentence about coffee')).toBe(true);
         await claude.play(result);
         expect(claude.readyEvents).toHaveLength(0);
 
-        // Its start was never reported; the next result must not wait again.
+        // Its lifecycle report went missing; the next result must not wait again.
         await claude.play(result);
+        expect(claude.outcomes).toEqual(['started:Add a sentence about coffee']);
         expect(claude.readyEvents).toHaveLength(1);
         expect(claude.getSteer()).toBeNull();
 
@@ -208,8 +289,9 @@ describe('claudeRemote mid-turn steering', () => {
         const steer = claude.getSteer();
         await claude.play(result);
 
-        expect(steer?.('Too late')).toBe(false);
+        expect(claude.steer('Too late', steer)).toBe(false);
         expect(claude.prompts).toHaveLength(1);
+        expect(claude.outcomes).toEqual([]);
 
         await claude.finish();
     });

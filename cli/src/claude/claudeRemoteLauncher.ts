@@ -1,7 +1,7 @@
 import React from "react";
 import { Session } from "./session";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
-import { claudeRemote } from "./claudeRemote";
+import { claudeRemote, type SteerFunction } from "./claudeRemote";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
 import { SDKAssistantMessage, SDKMessage, SDKUserMessage } from "./sdk";
@@ -146,7 +146,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
         });
 
         // Set by claudeRemote() while a turn is running.
-        let steerTarget: { steer: (message: string) => boolean; modeHash: string | null } | null = null;
+        let steerTarget: { steer: SteerFunction; modeHash: string | null } | null = null;
         const setSteerTarget = (target: typeof steerTarget) => {
             steerTarget = target;
             session.client.updateAgentState?.((state) => ({ ...state, steeringActive: target !== null }));
@@ -182,18 +182,29 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 if (!session.queue.beginReservationDispatch(taken)) {
                     return { steered: false, error: 'Steer cancelled' };
                 }
-                // Agent output already produced must reach the hub before the
-                // steer is acked, or it sorts below the steered message.
-                await messageQueue.flush();
-                if (taken.state !== 'dispatching') {
-                    return { steered: false, error: 'Steer cancelled' };
-                }
-                if (!steerTarget?.steer(text)) {
+                // The row stays reserved, not consumed, until Claude takes the
+                // prompt: Claude only holds it in memory until then, so an
+                // abort or crash must be able to put it back in the queue.
+                const steered = steerTarget.steer(text, {
+                    onStarted: async () => {
+                        // Agent output produced before Claude took the prompt
+                        // must reach the hub first, or it sorts below it.
+                        await messageQueue.flush();
+                        session.queue.commitReservation(taken);
+                        session.client.emitMessagesConsumed([localId], { steered: true });
+                    },
+                    onDropped: () => {
+                        session.client.discardPendingHubPromptEcho(localId);
+                        if (taken.state === 'dispatching' && !session.queue.isClosed()) {
+                            session.queue.restoreReservation(taken);
+                        }
+                    }
+                });
+                if (!steered) {
                     session.queue.restoreReservation(taken);
                     return { steered: false, error: 'No active steerable turn' };
                 }
-                session.queue.commitReservation(taken);
-                session.client.emitMessagesConsumed([localId], { steered: true });
+                session.client.notePendingHubPromptEcho(text, localId);
                 return { steered: true };
             }
         );
@@ -552,6 +563,14 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                         },
                         onSteerableChange: (steer) => {
                             setSteerTarget(steer ? { steer, modeHash } : null);
+                        },
+                        onResult: () => {
+                            // A steered prompt can keep the work going past
+                            // this result without onReady, but the delivered
+                            // message's turn is over: a later failure must not
+                            // replay it.
+                            reachedReadyThisAttempt = true;
+                            inFlightMessage = null;
                         },
                         onSessionReset: () => {
                             logger.debug('[remote]: Session reset');

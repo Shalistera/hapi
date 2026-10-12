@@ -6,9 +6,14 @@ import type { EnhancedMode } from './loop'
 // The steer RPC takes a queued message out of the waiting queue and writes it
 // into the running Claude turn. claudeRemote() is replaced by a turn that stays
 // open until the test ends it, so the RPC can be exercised mid-turn.
+type SteerCallbacks = { onStarted: () => void | Promise<void>; onDropped: () => void }
+
 const harness = vi.hoisted(() => ({
-    steered: [] as string[],
+    steered: [] as Array<{ message: string; callbacks: SteerCallbacks; settled: boolean }>,
     steerAccepts: true,
+    failAfterResult: false,
+    runs: 0,
+    respawnMessage: undefined as unknown,
     turnStarted: null as (() => void) | null,
     endTurn: null as (() => void) | null,
     triggerSwitch: null as (() => void) | null
@@ -16,15 +21,23 @@ const harness = vi.hoisted(() => ({
 
 vi.mock('./claudeRemote', () => ({
     claudeRemote: async (opts: any) => {
+        harness.runs += 1
+        if (harness.runs > 1) {
+            // Respawn after a failure: leave remote mode and record what the
+            // new process would have been handed.
+            harness.triggerSwitch?.()
+            harness.respawnMessage = await opts.nextMessage()
+            return
+        }
         const initial = await opts.nextMessage()
         if (!initial) {
             return
         }
-        opts.onSteerableChange((message: string) => {
+        opts.onSteerableChange((message: string, callbacks: SteerCallbacks) => {
             if (!harness.steerAccepts) {
                 return false
             }
-            harness.steered.push(message)
+            harness.steered.push({ message, callbacks, settled: false })
             return true
         })
         await new Promise<void>((resolve) => {
@@ -32,9 +45,29 @@ vi.mock('./claudeRemote', () => ({
             harness.turnStarted?.()
         })
         opts.onSteerableChange(null)
+        if (harness.failAfterResult) {
+            opts.onResult()
+        }
+        // Like claudeRemote(), prompts Claude never started go with the process.
+        for (const steer of harness.steered) {
+            if (!steer.settled) {
+                steer.settled = true
+                steer.callbacks.onDropped()
+            }
+        }
+        if (harness.failAfterResult) {
+            throw new Error('Claude exited')
+        }
         harness.triggerSwitch?.()
     }
 }))
+
+/** Claude takes the steered prompt into the turn. */
+async function startSteer(index: number): Promise<void> {
+    const steer = harness.steered[index]
+    steer.settled = true
+    await steer.callbacks.onStarted()
+}
 
 vi.mock('./utils/permissionHandler', () => ({
     PermissionHandler: class {
@@ -94,8 +127,8 @@ function createClientStub() {
         emitMessagesConsumed: vi.fn(),
         sendClaudeSessionMessage: () => {},
         sendSessionEvent: () => {},
-        notePendingHubPromptEcho: () => {},
-        discardPendingHubPromptEcho: () => {},
+        notePendingHubPromptEcho: vi.fn(),
+        discardPendingHubPromptEcho: vi.fn(),
         discardPendingHubPromptEchoText: () => {}
     }
 }
@@ -153,12 +186,15 @@ describe('claudeRemoteLauncher steer RPC', () => {
     afterEach(() => {
         harness.steered = []
         harness.steerAccepts = true
+        harness.failAfterResult = false
+        harness.runs = 0
+        harness.respawnMessage = undefined
         harness.turnStarted = null
         harness.endTurn = null
         harness.triggerSwitch = null
     })
 
-    it('steers a queued message into the running turn', async () => {
+    it('holds a steered message until Claude takes it, then marks it consumed', async () => {
         const turn = await startTurn()
         try {
             expect(turn.client.agentStates.at(-1)?.steeringActive).toBe(true)
@@ -166,13 +202,51 @@ describe('claudeRemoteLauncher steer RPC', () => {
 
             expect(await turn.steer('local-2')).toEqual({ steered: true })
 
-            expect(harness.steered).toEqual(['also check the tests'])
+            expect(harness.steered.map((steer) => steer.message)).toEqual(['also check the tests'])
             expect(turn.queue.size()).toBe(0)
+            expect(turn.client.notePendingHubPromptEcho).toHaveBeenCalledWith('also check the tests', 'local-2')
+            expect(turn.client.emitMessagesConsumed).not.toHaveBeenCalledWith(['local-2'], { steered: true })
+            // Claude holds it but has not run it: it cannot be cancelled, and
+            // it is not consumed yet.
+            expect(turn.queue.cancelByLocalId('local-2')).toBe('in-flight')
+
+            await startSteer(0)
+
             expect(turn.client.emitMessagesConsumed).toHaveBeenCalledWith(['local-2'], { steered: true })
+            expect(turn.queue.cancelByLocalId('local-2')).toBe('consumed')
         } finally {
             await turn.finish()
         }
         expect(turn.client.agentStates.at(-1)?.steeringActive).toBe(false)
+    })
+
+    it('puts a steered message back in the queue when Claude never starts it', async () => {
+        const turn = await startTurn()
+        turn.queue.push('earlier', { permissionMode: 'default' }, 'local-2')
+        turn.queue.push('also check the tests', { permissionMode: 'default' }, 'local-3')
+        turn.queue.push('later', { permissionMode: 'default' }, 'local-4')
+        try {
+            expect(await turn.steer('local-3')).toEqual({ steered: true })
+        } finally {
+            // The turn is interrupted before Claude reaches the prompt.
+            await turn.finish()
+        }
+
+        expect(turn.queue.queue.map((item) => item.localId)).toEqual(['local-2', 'local-3', 'local-4'])
+        expect(turn.client.discardPendingHubPromptEcho).toHaveBeenCalledWith('local-3')
+        expect(turn.client.emitMessagesConsumed).not.toHaveBeenCalledWith(['local-3'], { steered: true })
+    })
+
+    it('does not replay the delivered message when Claude fails after its result', async () => {
+        vi.stubEnv('CLAUDE_REMOTE_RESPAWN_BACKOFF_MS', '0')
+        harness.failAfterResult = true
+        const turn = await startTurn()
+        await turn.finish()
+        vi.unstubAllEnvs()
+
+        expect(harness.runs).toBe(2)
+        expect(harness.respawnMessage).toBeNull()
+        expect(turn.queue.size()).toBe(0)
     })
 
     it('leaves a message queued when its mode differs from the running turn', async () => {
