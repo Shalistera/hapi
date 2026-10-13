@@ -95,6 +95,42 @@ describe('resolveSessionHeaderMachineLabel', () => {
 })
 
 describe('SessionHeader', () => {
+    it('shows the Claude usage meter of the session machine for Claude sessions only', async () => {
+        const claudeUsage = {
+            fetchedAt: Date.now(),
+            subscriptionType: 'max',
+            limits: [
+                { kind: 'session', scope: null, percent: 15, resetsAt: null },
+                { kind: 'weekly_all', scope: null, percent: 60, resetsAt: null }
+            ]
+        }
+        const api = {
+            getMachines: vi.fn().mockResolvedValue({ machines: [{ id: 'machine-1', namespace: 'default', active: true, metadata: null, claudeUsage }] }),
+            getScratchlist: vi.fn().mockResolvedValue({ entries: [] })
+        } as unknown as ApiClient
+
+        renderHeaderWithApi(baseSession({
+            metadata: { flavor: 'claude', path: '/repo', host: 'machine', machineId: 'machine-1' }
+        }), api)
+
+        await waitFor(() => expect(screen.getByTestId('claude-usage-meter')).toHaveTextContent('60%'))
+        expect(screen.getByTestId('claude-usage-meter')).toHaveTextContent('15%')
+        cleanup()
+
+        renderHeaderWithApi(baseSession({
+            metadata: { flavor: 'codex', path: '/repo', host: 'machine', machineId: 'machine-1' }
+        }), api)
+        expect(screen.queryByTestId('claude-usage-meter')).toBeNull()
+    })
+
+    it('hides the Claude usage meter when turned off in header settings', () => {
+        localStorage.setItem('hapi-session-header-metadata', JSON.stringify({ claudeUsage: false }))
+
+        renderHeader(baseSession({ metadata: { flavor: 'claude', path: '/repo', host: 'machine', machineId: 'machine-1' } }))
+
+        expect(screen.queryByTestId('claude-usage-meter')).toBeNull()
+    })
+
     it('does not offer manual Codex sync while the HAPI session is active', () => {
         const api = {
             getMachines: vi.fn().mockResolvedValue({ machines: [] }),

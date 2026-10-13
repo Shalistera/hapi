@@ -1,7 +1,7 @@
 import type { SessionHeaderMetadataPreferences } from '@/hooks/useSessionHeaderMetadata'
 import { formatReasoningLabel, getReasoningEffortForFlavor } from '@/lib/codexStatusLabels'
 
-export type ShareTurnMetadataKey = Exclude<keyof SessionHeaderMetadataPreferences, 'showLabels'>
+export type ShareTurnMetadataKey = Exclude<keyof SessionHeaderMetadataPreferences, 'showLabels' | 'claudeUsage'>
 
 export type ShareTurnMetadataItem = {
     key: ShareTurnMetadataKey

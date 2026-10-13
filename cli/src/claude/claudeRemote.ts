@@ -61,7 +61,12 @@ export async function claudeRemote(opts: {
      * it is not. The steer function writes a prompt into the running turn and
      * returns false if that is no longer possible.
      */
-    onSteerableChange?: (steer: SteerFunction | null) => void
+    onSteerableChange?: (steer: SteerFunction | null) => void,
+    /**
+     * Called with a `get_usage` reader once the Claude process is spawned, and
+     * with null once it is gone.
+     */
+    onUsageReaderChange?: (reader: ((timeoutMs: number) => Promise<unknown>) | null) => void
 }) {
     const debugPrefix = '[claudeRemote][async-debug]';
 
@@ -378,6 +383,7 @@ export async function claudeRemote(opts: {
 
     updateThinking(true);
     try {
+        opts.onUsageReaderChange?.((timeoutMs) => response.getUsage(timeoutMs));
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
         for await (const message of response) {
@@ -561,6 +567,7 @@ export async function claudeRemote(opts: {
         for (const uuid of [...pendingSteers.keys()]) {
             dropSteer(uuid);
         }
+        opts.onUsageReaderChange?.(null);
         updateThinking(false);
     }
 }
