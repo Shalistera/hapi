@@ -747,10 +747,6 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
             // Advertise steerability so the web's queued-message Steer button
             // is reachable at all; only a normal active prompt may set it.
             this.setSteeringActive(true);
-            // Captured before the prompt await: handleAbort replaces
-            // this.abortController, so the drain below must race the turn's
-            // own signal to stay abort-aware.
-
             try {
                 await backend.prompt(acpSessionId, promptContent, (message: AgentMessage) => {
                     this.handleAgentMessage(message);
