@@ -15,7 +15,7 @@ import {
 import type { CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, MessageDeliveryMode, MessagesResponse, QueuedStateResponse, RewindConversationErrorCode, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
 import type { SteerQueuedMessageResponse } from '@hapi/protocol/schemas'
 import type { ImplementCodexPlanResult } from '@hapi/protocol/apiTypes'
-import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
+import type { AgentFlavor, ClaudeUsage, CodexCollaborationMode, CopilotAgentMode, DecryptedMessage, PermissionMode, RefreshClaudeUsageResponse, Session, SyncEvent } from '@hapi/protocol/types'
 import { hasConversationMessageContent, unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
 import type { Server } from 'socket.io'
 import { randomUUID } from 'node:crypto'
@@ -911,6 +911,14 @@ export class SyncEngine {
 
     handleMachineAlive(payload: { machineId: string; time: number; health?: unknown }): void {
         this.machineCache.handleMachineAlive(payload)
+    }
+
+    handleClaudeUsage(payload: { machineId: string; namespace: string; usage: ClaudeUsage }): void {
+        this.machineCache.handleClaudeUsage(payload.machineId, payload.namespace, payload.usage)
+    }
+
+    async refreshClaudeUsage(sessionId: string): Promise<RefreshClaudeUsageResponse> {
+        return await this.rpcGateway.refreshClaudeUsage(sessionId)
     }
 
     /**

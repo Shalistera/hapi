@@ -50,6 +50,49 @@ afterEach(() => {
 })
 
 describe('Query', () => {
+    it('reads usage with a get_usage control request', async () => {
+        const { Query } = await import('./query')
+        const stdin = new PassThrough()
+        const stdout = new PassThrough()
+        const query = new Query(stdin, stdout, new Promise<void>(() => {}))
+        const written: string[] = []
+        stdin.on('data', (chunk: Buffer) => written.push(chunk.toString()))
+
+        const usage = query.getUsage(1_000)
+        await vi.waitFor(() => expect(written).toHaveLength(1))
+        const request = JSON.parse(written[0])
+        expect(request).toMatchObject({
+            type: 'control_request',
+            request: { subtype: 'get_usage', skip_behaviors: true }
+        })
+
+        stdout.write(JSON.stringify({
+            type: 'control_response',
+            response: {
+                subtype: 'success',
+                request_id: request.request_id,
+                response: { rate_limits_available: true }
+            }
+        }) + '\n')
+
+        await expect(usage).resolves.toEqual({ rate_limits_available: true })
+    })
+
+    it('rejects a usage read that Claude never answers', async () => {
+        vi.useFakeTimers()
+        try {
+            const { Query } = await import('./query')
+            const query = new Query(new PassThrough(), new PassThrough(), new Promise<void>(() => {}))
+
+            const usage = query.getUsage(1_000)
+            const assertion = expect(usage).rejects.toThrow('get_usage timed out')
+            await vi.advanceTimersByTimeAsync(1_000)
+            await assertion
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
     it('preserves externally set errors even if the process exits cleanly', async () => {
         const { Query } = await import('./query')
         const stdout = new PassThrough()

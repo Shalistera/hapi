@@ -520,6 +520,50 @@ export const MachineHealthSchema = z.object({
 
 export type MachineHealth = z.infer<typeof MachineHealthSchema>
 
+/**
+ * One Claude plan usage meter (claude.ai subscription rate-limit window), as
+ * Claude Code's `get_usage` control request reports it.
+ */
+export const ClaudeUsageLimitSchema = z.object({
+    // Server meter kind, e.g. 'session' (5-hour), 'weekly_all', 'weekly_scoped'.
+    kind: z.string().min(1).max(64),
+    // Model or surface a scoped meter applies to, e.g. 'Fable'.
+    scope: z.string().max(128).nullable().optional(),
+    // Share of the window used, 0-100 (may run past 100).
+    percent: z.number().finite().nonnegative(),
+    resetsAt: z.number().finite().nullable(),
+    // Server grading for the meter colour, e.g. 'normal', 'warning', 'critical'.
+    severity: z.string().max(32).optional()
+})
+
+export type ClaudeUsageLimit = z.infer<typeof ClaudeUsageLimitSchema>
+
+/**
+ * Claude plan usage reported by a Claude session. Usage is account-wide, so
+ * the hub keeps the latest snapshot per machine (in memory only).
+ */
+export const ClaudeUsageSchema = z.object({
+    fetchedAt: z.number().finite(),
+    subscriptionType: z.string().max(64).nullable().optional(),
+    limits: z.array(ClaudeUsageLimitSchema).max(32)
+})
+
+export type ClaudeUsage = z.infer<typeof ClaudeUsageSchema>
+
+/**
+ * Answer to a manual Claude usage refresh. `not-running`: the session has no
+ * Claude process to ask; `unavailable`: plan limits do not apply to its login
+ * (API key, Bedrock, Vertex).
+ */
+export const RefreshClaudeUsageResponseSchema = z.discriminatedUnion('status', [
+    z.object({ status: z.literal('ok'), usage: ClaudeUsageSchema }),
+    z.object({ status: z.literal('not-running') }),
+    z.object({ status: z.literal('unavailable') }),
+    z.object({ status: z.literal('failed') })
+])
+
+export type RefreshClaudeUsageResponse = z.infer<typeof RefreshClaudeUsageResponseSchema>
+
 export const MachineSchema = z.object({
     id: z.string(),
     namespace: z.string(),
@@ -532,7 +576,8 @@ export const MachineSchema = z.object({
     metadataVersion: z.number(),
     runnerState: RunnerStateSchema.nullable(),
     runnerStateVersion: z.number(),
-    health: MachineHealthSchema.nullable().optional()
+    health: MachineHealthSchema.nullable().optional(),
+    claudeUsage: ClaudeUsageSchema.nullable().optional()
 })
 
 export type Machine = z.infer<typeof MachineSchema>

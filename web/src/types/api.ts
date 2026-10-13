@@ -59,6 +59,8 @@ export type {
 export type {
     AgentState,
     AttachmentMetadata,
+    ClaudeUsage,
+    ClaudeUsageLimit,
     CodexCollaborationMode,
     CopilotAgentMode,
     Metadata,
@@ -67,6 +69,7 @@ export type {
     MachineHealth,
     PendingRequest,
     PendingRequestKind,
+    RefreshClaudeUsageResponse,
     RunnerState,
     Session,
     SessionPatch,

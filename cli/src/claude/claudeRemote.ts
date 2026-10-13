@@ -39,7 +39,12 @@ export async function claudeRemote(opts: {
     onMessage: (message: SDKMessage) => void,
     onFirstResult?: (initialMessage: string) => void,
     onCompletionEvent?: (message: string) => void,
-    onSessionReset?: () => void
+    onSessionReset?: () => void,
+    /**
+     * Called with a `get_usage` reader once the Claude process is spawned, and
+     * with null once it is gone.
+     */
+    onUsageReaderChange?: (reader: ((timeoutMs: number) => Promise<unknown>) | null) => void
 }) {
     const debugPrefix = '[claudeRemote][async-debug]';
 
@@ -279,6 +284,7 @@ export async function claudeRemote(opts: {
 
     updateThinking(true);
     try {
+        opts.onUsageReaderChange?.((timeoutMs) => response.getUsage(timeoutMs));
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
         for await (const message of response) {
@@ -417,6 +423,7 @@ export async function claudeRemote(opts: {
             `${debugPrefix} finally ` +
             `(streamMessages=${streamMessageSeq}, results=${resultSeq}, nextFetches=${nextMessageFetchSeq}, inputEnded=${inputEnded})`
         );
+        opts.onUsageReaderChange?.(null);
         updateThinking(false);
     }
 }

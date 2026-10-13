@@ -205,7 +205,8 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
         onSessionActivity: (sessionId, updatedAt) => syncEngine?.recordSessionActivity(sessionId, updatedAt),
         onAgentProgress: (sessionId, at) => syncEngine?.recordAgentProgress(sessionId, at),
         onSweepImmediateQueued: (sessionId, now) => syncEngine?.sweepImmediateQueuedOnSessionEnd(sessionId, now),
-        onMessagesConsumed: (sessionId) => syncEngine?.clearQueuedThinkingGrace(sessionId)
+        onMessagesConsumed: (sessionId) => syncEngine?.clearQueuedThinkingGrace(sessionId),
+        onClaudeUsage: (payload) => syncEngine?.handleClaudeUsage(payload)
     })
 
     syncEngine = new SyncEngine(store, socketServer.io, socketServer.rpcRegistry, sseManager)

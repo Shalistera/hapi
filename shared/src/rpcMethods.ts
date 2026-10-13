@@ -49,6 +49,8 @@ export const RPC_METHODS = {
     ListAgyModels: 'listAgyModels',
     /** Deliver one queued message into the active Pi turn (native steer). */
     SteerQueuedMessage: 'steer-queued-message',
+    /** Re-read Claude plan usage limits from the session's Claude process. */
+    RefreshClaudeUsage: 'refresh-claude-usage',
     ForkConversation: 'fork-conversation',
     RewindConversation: 'rewind-conversation',
     ClearConversation: 'clear-conversation',

@@ -13,6 +13,7 @@ import { configuration } from '@/configuration'
 import { extractUserRequest } from '@/agy/utils/agyMessageText'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from "@hapi/protocol"
 import type { SessionEndReason } from '@hapi/protocol'
+import type { ClaudeUsage } from '@hapi/protocol/types'
 import type { ClientToServerEvents, ServerToClientEvents, TerminalOutputPayload, Update } from '@hapi/protocol'
 import {
     AgentTerminalInputPayloadSchema,
@@ -289,6 +290,7 @@ export class ApiSessionClient extends EventEmitter {
     private metadataChangedDuringAttempt = false
     private agentStateChangedDuringAttempt = false
     private readonly pendingOutboundEvents: PendingOutboundEvent[] = []
+    private lastClaudeUsage: ClaudeUsage | null = null
     private didWarnPendingQueueFull = false
 
     constructor(token: string, session: Session, options: ApiSessionClientOptions = {}) {
@@ -361,6 +363,10 @@ export class ApiSessionClient extends EventEmitter {
                 time: Date.now(),
                 thinking: false
             })
+            // The hub keeps Claude usage in memory only; restore it after a hub restart.
+            if (this.lastClaudeUsage && this.state === 'active') {
+                this.socket.emit('claude-usage', { sid: this.sessionId, usage: this.lastClaudeUsage })
+            }
         })
 
         this.socket.on('rpc-request', async (data: { method: string; params: string }, callback: (response: string) => void) => {
@@ -1299,6 +1305,14 @@ export class ApiSessionClient extends EventEmitter {
             mode,
             ...(runtime ?? {})
         })
+    }
+
+    /** Claude plan usage read from this session's Claude process (account-wide; stored per machine). */
+    reportClaudeUsage(usage: ClaudeUsage): void {
+        this.lastClaudeUsage = usage
+        if (this.state === 'active') {
+            this.socket.emit('claude-usage', { sid: this.sessionId, usage })
+        }
     }
 
     /** Hub waits for this before mergeSessions on Cursor ACP reopen (tiann/hapi#939). */
