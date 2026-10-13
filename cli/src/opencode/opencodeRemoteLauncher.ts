@@ -750,7 +750,6 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
             // Captured before the prompt await: handleAbort replaces
             // this.abortController, so the drain below must race the turn's
             // own signal to stay abort-aware.
-            const promptTurnSignal = this.abortController.signal;
 
             try {
                 await backend.prompt(acpSessionId, promptContent, (message: AgentMessage) => {
@@ -775,7 +774,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 // Drain before ready / thinking=false / the next batch, so a
                 // steer that settled (or is still restoring) cannot cross the
                 // turn boundary into the next prompt or a /compact.
-                await this.drainSteerOperations(promptTurnSignal);
+                await this.drainSteerOperations();
                 session.onThinkingChange(false);
                 await this.permissionHandler?.cancelAll('Prompt finished');
                 if (session.queue.size() === 0 && !this.shouldExit) {
@@ -1026,22 +1025,16 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 // Completion still gates the next normal prompt and settles
                 // backend ownership. A failure after proven native acceptance
                 // must never restore/replay that input. If no receipt is
-                // available, retain the rejection/indeterminate contract.
+                // available, hold a completion failure indeterminate.
                 void steer.completed.then(acknowledgeAcceptance, async (error) => {
                     await nativeReceipt;
                     if (accepted) return;
-                    if (isAcpIndeterminateError(error)) {
-                        if (session.queue.markReservationIndeterminate(taken)) {
-                            session.client.emitSteerIndeterminate([localId]);
-                        }
-                        logger.debug('[opencode-remote] soft-steer outcome unknown after dispatch; row held for explicit resolution', error);
-                        return;
+                    // ACP provider errors may arrive after native input acceptance.
+                    // Without a receipt, dispatch completion cannot prove rejection.
+                    if (session.queue.markReservationIndeterminate(taken)) {
+                        session.client.emitSteerIndeterminate([localId]);
                     }
-                    return restoreQueuedReservation().then((restored) => {
-                        if (restored) {
-                            logger.debug('[opencode-remote] soft-steer rejected by ACP; row restored', error);
-                        }
-                    });
+                    logger.debug('[opencode-remote] soft-steer outcome unknown after dispatch; row held for explicit resolution', error);
                 }).finally(() => {
                     releaseOperation();
                 });
@@ -1174,29 +1167,12 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
         backend.abortSoftSteers();
     }
 
-    /**
-     * Waits for every tracked steer operation to finish its bookkeeping.
-     * Abort-aware through the *original* turn signal: handleAbort replaces
-     * this.abortController, so reading the field here would miss the abort.
-     */
-    private async drainSteerOperations(turnSignal: AbortSignal): Promise<void> {
-        if (this.pendingSteerOperations.size === 0) return;
-        if (turnSignal.aborted) {
-            // The turn was aborted; its steer work must not gate the next one.
-            return;
-        }
-        const pending = Array.from(this.pendingSteerOperations, (operation) => operation.settled);
-        let releaseWait!: () => void;
-        const abortListener = () => releaseWait();
-        turnSignal.addEventListener('abort', abortListener, { once: true });
-        try {
-            await Promise.race([
-                Promise.allSettled(pending),
-                new Promise<void>((resolve) => { releaseWait = resolve; })
-            ]);
-        } finally {
-            turnSignal.removeEventListener('abort', abortListener);
-        }
+    /** Wait for remaining durable writes/restores, including after a plain Stop.
+     * closeSteerGate detaches only stranded runtime requests; their callbacks
+     * remain attached, while undispatched/settled bookkeeping still gates FIFO. */
+    private async drainSteerOperations(): Promise<void> {
+        const pending = Array.from(this.pendingSteerOperations, operation => operation.settled);
+        await Promise.allSettled(pending);
     }
 
     /**

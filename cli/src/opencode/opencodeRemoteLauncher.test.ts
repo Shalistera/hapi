@@ -2565,6 +2565,20 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         return stub.rpcHandlers.get('steer-queued-message') as SteerHandler;
     }
 
+    async function startRejectedDispatchRestore(stub: SteerSession) {
+        let rejectDispatch!: (error: Error) => void;
+        const dispatched = new Promise<void>((_, reject) => { rejectDispatch = reject; });
+        harness.deferSoftSteerDispatch = dispatched;
+        harness.deferSoftSteer = dispatched;
+        const steering = steerHandlerOf(stub)({ localId: 'steer' });
+        await vi.waitFor(() => expect(harness.softSteerCalls).toHaveLength(1));
+        let releaseState!: () => void;
+        harness.deferSteerState = new Promise<void>(resolve => { releaseState = resolve; });
+        rejectDispatch(new Error('stdin rejected before transmission'));
+        await vi.waitFor(() => expect(harness.steerStateCalls).toContainEqual({ localIds: ['steer'], state: 'queued' }));
+        return { steering, releaseState };
+    }
+
     it('injects a compatible queued message into the active turn without cancelling it', async () => {
         let releaseSoftSteer!: () => void;
         harness.deferSoftSteer = new Promise<void>((resolve) => { releaseSoftSteer = resolve; });
@@ -2910,6 +2924,79 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         await stopTurn(stub, releasePrompt, runPromise);
     });
 
+    it('keeps a provider failure indeterminate when native receipts are unavailable', async () => {
+        const receipts = await import('./utils/opencodeInputReceipt');
+        const receipt = vi.spyOn(receipts, 'fetchOpencodeUserMessages').mockResolvedValue(null);
+        let rejectSteer!: (error: Error) => void;
+        harness.deferSoftSteer = new Promise<void>((_, reject) => { rejectSteer = reject; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        try {
+            stub.session.queue.push('correction', createMode(), 'steer');
+            await steerHandlerOf(stub)({ localId: 'steer' });
+            rejectSteer(new Error('provider failed after persisting input'));
+            await vi.waitFor(() => expect(stub.steerIndeterminateCalls).toEqual([['steer']]));
+            expect(stub.session.queue.peekByLocalId('steer')).toBeNull();
+            expect(harness.steerStateCalls).not.toContainEqual({ localIds: ['steer'], state: 'queued' });
+            expect(stub.emitMessagesConsumedCalls).toEqual([]);
+        } finally {
+            receipt.mockRestore(); harness.deferSoftSteer = null;
+            await stopTurn(stub, releasePrompt, runPromise);
+        }
+    });
+
+    it('never replays overlapping steers after an ordinary provider failure', async () => {
+        const receipts = await import('./utils/opencodeInputReceipt');
+        let releaseSnapshot!: (value: Array<{ id: string; text: string }>) => void;
+        const receipt = vi.spyOn(receipts, 'fetchOpencodeUserMessages')
+            .mockImplementationOnce(() => new Promise(resolve => { releaseSnapshot = resolve; }))
+            .mockResolvedValue([{ id: 'native-new', text: 'correction' }]);
+        let rejectSteer!: (error: Error) => void;
+        harness.deferSoftSteer = new Promise<void>((_, reject) => { rejectSteer = reject; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        let first: Promise<unknown> | undefined;
+        try {
+            stub.session.queue.push('correction', createMode(), 'steer-1');
+            first = steerHandlerOf(stub)({ localId: 'steer-1' });
+            await vi.waitFor(() => expect(receipt).toHaveBeenCalledOnce());
+            stub.session.queue.push('correction', createMode(), 'steer-2');
+            await steerHandlerOf(stub)({ localId: 'steer-2' });
+            releaseSnapshot([]); await first;
+            rejectSteer(new Error('provider failed after dispatch'));
+            await vi.waitFor(() => expect(stub.steerIndeterminateCalls.flat().sort()).toEqual(['steer-1', 'steer-2']));
+            expect(harness.steerStateCalls.filter(call => call.state === 'queued')).toEqual([]);
+            expect(stub.emitMessagesConsumedCalls).toEqual([]);
+        } finally {
+            releaseSnapshot?.([]); await first?.catch(() => {});
+            receipt.mockRestore(); harness.deferSoftSteer = null;
+            await stopTurn(stub, releasePrompt, runPromise);
+        }
+    });
+
+    it('keeps undispatched persistence gated after plain Stop before a newer message', async () => {
+        let releaseState!: () => void;
+        harness.deferSteerState = new Promise<void>(resolve => { releaseState = resolve; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        stub.session.queue.push('older correction', createMode(), 'steer');
+        const steering = steerHandlerOf(stub)({ localId: 'steer' });
+        try {
+            await vi.waitFor(() => expect(harness.steerStateCalls).toContainEqual({ localIds: ['steer'], state: 'dispatching' }));
+            await (stub.rpcHandlers.get('abort') as () => Promise<void>)();
+            stub.session.queue.push('newer input', createMode(), 'newer');
+            releasePrompt();
+            await vi.waitFor(() => expect(harness.events).toContain('prompt:end'));
+            await new Promise<void>(resolve => setImmediate(resolve));
+            expect(harness.promptCount).toBe(1);
+            expect(stub.sessionEvents.filter(event => event.type === 'ready')).toEqual([]);
+            releaseState(); await steering;
+            await vi.waitFor(() => expect(harness.promptCount).toBe(2));
+            expect(harness.promptContents[1]).toEqual([{ type: 'text', text: 'older correction\nnewer input' }]);
+            expect(harness.softSteerCalls).toEqual([]);
+        } finally {
+            releaseState(); await steering.catch(() => {});
+            harness.deferSteerState = null; releasePrompt(); stub.session.queue.close(); await runPromise;
+        }
+    });
+
     it('holds an ambiguous completion failure and never replays it', async () => {
         let rejectSoftSteer!: (error: Error) => void;
         harness.deferSoftSteer = new Promise<void>((_, reject) => { rejectSoftSteer = reject; });
@@ -3102,46 +3189,24 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         await runPromise;
     });
 
-    it('keeps the next prompt and ready blocked until a completion-time rejection is fully restored', async () => {
-        let rejectSoftSteer!: (error: Error) => void;
-        harness.deferSoftSteer = new Promise<void>((_, reject) => { rejectSoftSteer = reject; });
-        let releaseQueuedState!: () => void;
-        let queuedStateHeld = false;
+    it('keeps the next prompt gated until a definite dispatch rejection is fully restored', async () => {
         const { stub, releasePrompt, runPromise } = await startTurn();
-
         stub.session.queue.push('mid-turn correction', createMode(), 'steer');
         stub.session.queue.push('second', createMode(), 'second');
-        await expect(steerHandlerOf(stub)({ localId: 'steer' })).resolves.toEqual({ steered: true });
-
-        // ACP rejects the inject only after the foreground prompt is gone, and
-        // the durable "back to queued" write is slow.
-        harness.deferSteerState = new Promise<void>((resolve) => {
-            releaseQueuedState = () => {
-                queuedStateHeld = false;
-                resolve();
-            };
-        });
+        const { steering, releaseState } = await startRejectedDispatchRestore(stub);
         releasePrompt();
-        rejectSoftSteer(new Error('session/prompt rejected'));
-        await vi.waitFor(() => expect(harness.steerStateCalls).toContainEqual(
-            { localIds: ['steer'], state: 'queued' }
-        ));
-        queuedStateHeld = true;
+        await vi.waitFor(() => expect(harness.events).toContain('prompt:end'));
         expect(harness.promptCount).toBe(1);
-        expect(stub.sessionEvents.filter((event) => event.type === 'ready')).toEqual([]);
-
-        releaseQueuedState();
-        // Only now may the next prompt start, and the row is delivered by it.
+        expect(stub.sessionEvents.filter(event => event.type === 'ready')).toEqual([]);
+        releaseState(); await steering;
         await vi.waitFor(() => expect(harness.promptCount).toBe(2));
         expect(JSON.stringify(harness.promptContents[1])).toContain('mid-turn correction');
         expect(stub.emitMessagesConsumedCalls).toEqual([]);
         expect(stub.steerIndeterminateCalls).toEqual([]);
-        void queuedStateHeld;
-
-        harness.deferSteerState = null;
-        stub.session.queue.close();
-        await runPromise;
+        harness.deferSteerState = null; harness.deferSoftSteerDispatch = null; harness.deferSoftSteer = null;
+        stub.session.queue.close(); await runPromise;
     });
+
 
     it('refuses a new steer once a stalled runtime has been cancelled from stderr', async () => {
         let releasePrompt!: () => void;
@@ -3187,46 +3252,24 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         await runPromise;
     });
 
-    it('completes a pending restore without sending anywhere once a switch has begun', async () => {
-        let rejectSoftSteer!: (error: Error) => void;
-        harness.deferSoftSteer = new Promise<void>((_, reject) => { rejectSoftSteer = reject; });
-        let releaseQueuedState!: () => void;
+    it('completes a definite pre-dispatch restore before a switch finishes cleanup', async () => {
         const { stub, releasePrompt, runPromise } = await startTurn();
-
         stub.session.queue.push('mid-turn correction', createMode(), 'steer');
-        await expect(steerHandlerOf(stub)({ localId: 'steer' })).resolves.toEqual({ steered: true });
-
-        // ACP rejects only after the foreground prompt is gone, and the durable
-        // "back to queued" write is slow, so a restore is still pending.
-        harness.deferSteerState = new Promise<void>((resolve) => { releaseQueuedState = resolve; });
+        const { steering, releaseState } = await startRejectedDispatchRestore(stub);
         releasePrompt();
-        rejectSoftSteer(new Error('session/prompt rejected'));
-        await vi.waitFor(() => expect(harness.steerStateCalls).toContainEqual(
-            { localIds: ['steer'], state: 'queued' }
-        ));
-
-        // A switch begins before cleanup runs: the gate closes synchronously
-        // and the abort releases the foreground drain.
-        const switchPromise = (stub.rpcHandlers.get('switch') as () => Promise<void>)();
+        const switching = (stub.rpcHandlers.get('switch') as () => Promise<void>)();
+        await vi.waitFor(() => expect(stub.steeringActiveCalls.at(-1)).toBe(false));
+        expect(harness.promptCount).toBe(1);
+        releaseState(); await steering; await switching;
         await vi.waitFor(() => expect(harness.cleanupEvents).toContain('cleanup:disconnect'));
-        await expect(steerHandlerOf(stub)({ localId: 'first' })).resolves.toMatchObject({ steered: false });
-
-        releaseQueuedState();
-        await switchPromise;
-
-        // The restore still finishes its bookkeeping, but nothing is sent into
-        // the backend this session is leaving, and no counter is force-settled:
-        // the steer's ACP request had already settled when ACP rejected it.
         expect(harness.softSteerCalls).toHaveLength(1);
         expect(harness.abortSoftSteersCalls).toBe(0);
         expect(stub.emitMessagesConsumedCalls).toEqual([]);
         expect(stub.steerIndeterminateCalls).toEqual([]);
-
-        harness.deferSteerState = null;
-        harness.deferSoftSteer = null;
-        stub.session.queue.close();
-        await runPromise;
+        harness.deferSteerState = null; harness.deferSoftSteerDispatch = null; harness.deferSoftSteer = null;
+        stub.session.queue.close(); await runPromise;
     });
+
 
     it('force-settles a killed soft steer so the next turn\'s model update is not blocked', async () => {
         harness.sessionModelsMetadata = { currentModelId: 'ollama/first', availableModels: [] };
@@ -3409,56 +3452,29 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         await runPromise;
     });
 
-    it('keeps a restoring steer gating the queue after a stall cancel, even though its request already settled', async () => {
-        let rejectSoftSteer!: (error: Error) => void;
-        harness.deferSoftSteer = new Promise<void>((_, reject) => { rejectSoftSteer = reject; });
-        let releaseQueuedState!: () => void;
+    it.each(['stall', 'plain Stop'])('keeps a settled pre-dispatch restoration gated after %s', async reason => {
         const { stub, releasePrompt, runPromise } = await startTurn();
-
         stub.session.queue.push('steer row', createMode(), 'steer');
+        const { steering, releaseState } = await startRejectedDispatchRestore(stub);
+        if (reason === 'stall') {
+            harness.stderrHandler!({ type: 'quota_exceeded', message: 'API quota exceeded. Retrying in 30 seconds', raw: 'quota exceeded' });
+            await vi.waitFor(() => expect(harness.cancelPrompt).toHaveBeenCalledWith('acp-session-1'));
+        } else await (stub.rpcHandlers.get('abort') as () => Promise<void>)();
         stub.session.queue.push('newer row', createMode(), 'newer');
-        // Dispatched, then rejected outright: the ACP request is finished, but
-        // the definite rejection is restoring the row through a slow queued ACK.
-        await expect(steerHandlerOf(stub)({ localId: 'steer' })).resolves.toEqual({ steered: true });
-        harness.deferSteerState = new Promise<void>((resolve) => { releaseQueuedState = resolve; });
-        rejectSoftSteer(new Error('session/prompt rejected'));
-        await vi.waitFor(() => expect(harness.steerStateCalls).toContainEqual(
-            { localIds: ['steer'], state: 'queued' }
-        ));
-
-        // A stall lands mid-restore. The soft request is already settled, so
-        // this must not force-settle the backend nor release the row's drain
-        // tracking.
-        harness.stderrHandler!({
-            type: 'quota_exceeded',
-            message: 'API quota exceeded. Retrying in 30 seconds',
-            raw: 'quota exceeded'
-        });
-        await vi.waitFor(() => expect(harness.cancelPrompt).toHaveBeenCalledWith('acp-session-1'));
-        // Two turns of the event loop are enough for the cancel's finally to
-        // have run: the settled request must not trigger a counter force-settle.
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        expect(harness.abortSoftSteersCalls).toBe(0);
-
         releasePrompt();
         await vi.waitFor(() => expect(harness.events).toContain('prompt:end'));
-        // The newer row must not overtake a steer row that is still being
-        // restored, and no ready may fire while it is held.
+        expect(harness.abortSoftSteersCalls).toBe(0);
         expect(harness.promptCount).toBe(1);
-        expect(stub.sessionEvents.filter((event) => event.type === 'ready')).toEqual([]);
-
-        releaseQueuedState();
+        expect(stub.sessionEvents.filter(event => event.type === 'ready')).toEqual([]);
+        releaseState(); await steering;
         await vi.waitFor(() => expect(harness.promptCount).toBe(2));
         expect(harness.promptContents[1]).toEqual([{ type: 'text', text: 'steer row\nnewer row' }]);
         expect(stub.emitMessagesConsumedCalls).toEqual([]);
         expect(stub.steerIndeterminateCalls).toEqual([]);
-
-        harness.deferSteerState = null;
-        harness.deferSoftSteer = null;
-        stub.session.queue.close();
-        await runPromise;
+        harness.deferSteerState = null; harness.deferSoftSteerDispatch = null; harness.deferSoftSteer = null;
+        stub.session.queue.close(); await runPromise;
     });
+
 
     it('keeps a newer turn\'s soft-steer ownership when an older settled request reports late', async () => {
         let settleFirst!: () => void;
