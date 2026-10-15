@@ -11,6 +11,9 @@ import { SDKToLogConverter } from "./utils/sdkToLogConverter";
 import { PLAN_FAKE_REJECT } from "./sdk/prompts";
 import { EnhancedMode } from "./loop";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
+import { UsageLimitAutoContinue } from "./utils/usageLimitAutoContinue";
+import { IdleCompactor, resolveIdleCompactionConfig } from "./utils/idleCompactor";
+import { readClaudeBooleanSetting } from "./utils/claudeSettings";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
 import { applySessionTitleFallback } from './utils/sessionTitleFallback';
 import {
@@ -51,6 +54,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     private abortFuture: Future<void> | null = null;
     private permissionHandler: PermissionHandler | null = null;
     private handleSessionFound: ((sessionId: string) => void) | null = null;
+    private autoContinue: UsageLimitAutoContinue | null = null;
+    private idleCompactor: IdleCompactor | null = null;
 
     constructor(session: Session) {
         super(process.env.DEBUG ? session.logPath : undefined);
@@ -92,6 +97,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
     private async handleAbortRequest(): Promise<void> {
         logger.debug('[remote]: doAbort');
+        this.autoContinue?.cancel();
+        this.idleCompactor?.cancel();
         await this.abort();
     }
 
@@ -157,12 +164,18 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
         this.handleSessionFound = handleSessionFound;
         session.addSessionFoundCallback(handleSessionFound);
 
+        // Created once `pending` exists (their checks read it); see below.
+        let autoContinue: UsageLimitAutoContinue | null = null;
+        let idleCompactor: IdleCompactor | null = null;
+
         let planModeToolCalls = new Set<string>();
         let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
 
         function onMessage(message: SDKMessage) {
             formatClaudeMessageForInk(message, messageBuffer);
             permissionHandler.onMessage(message);
+            autoContinue?.onMessage(message);
+            idleCompactor?.onMessage(message);
 
             if (message.type === 'assistant') {
                 let umessage = message as SDKAssistantMessage;
@@ -318,6 +331,44 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 items: Array<{ message: string; localId?: string }>;
             } | null = null;
 
+            // Mode of the last turn handed to Claude. Turns HAPI starts on its
+            // own (continue after a usage limit, idle compaction) reuse it,
+            // with the session's current permission mode, model and effort,
+            // which the user may have changed while the session sat idle.
+            let lastDeliveredMode: EnhancedMode | null = null;
+            const modeForAutomaticTurn = (): EnhancedMode => ({
+                ...lastDeliveredMode,
+                permissionMode: session.getPermissionMode() ?? lastDeliveredMode?.permissionMode ?? 'default',
+                model: session.getModel() ?? undefined,
+                effort: session.getEffort() ?? undefined,
+            });
+            const notify = (message: string) => {
+                session.client.sendSessionEvent({ type: 'message', message });
+            };
+            const inputIsIdle = () => !this.exitReason && !pending && session.queue.size() === 0;
+
+            const usageLimit = new UsageLimitAutoContinue({
+                isEnabled: () => readClaudeBooleanSetting('autoContinueAtUsageLimit', session.path) !== false,
+                canContinue: inputIsIdle,
+                continueTask: (prompt) => session.queue.push(prompt, modeForAutomaticTurn()),
+                notify,
+            });
+            const compactor = new IdleCompactor({
+                getConfig: () => resolveIdleCompactionConfig({
+                    env: { ...process.env, ...session.claudeEnvVars },
+                    readSetting: (key) => readClaudeBooleanSetting(key, session.path),
+                }),
+                canCompact: () => inputIsIdle() && !usageLimit.isLimited(),
+                compact: () => session.queue.pushIsolated('/compact', modeForAutomaticTurn()),
+                notify,
+            });
+            autoContinue = this.autoContinue = usageLimit;
+            idleCompactor = this.idleCompactor = compactor;
+            const onInput = () => {
+                usageLimit.onUserInput();
+                compactor.cancel();
+            };
+
             let previousSessionId: string | null = null;
             let immediateFailureCount = 0;
             while (!this.exitReason) {
@@ -411,6 +462,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                             if (pending) {
                                 let p = pending;
                                 pending = null;
+                                onInput();
+                                lastDeliveredMode = p.mode;
                                 // Seed the mode gate from the parked batch. Without this,
                                 // an attempt that starts from `pending` keeps modeHash=null,
                                 // so the next mode switch fails the hash check and its
@@ -438,6 +491,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                             let msg = await session.queue.waitForMessagesAndGetAsString(controller.signal);
 
                             if (msg) {
+                                onInput();
                                 if ((modeHash && msg.hash !== modeHash) || msg.isolate) {
                                     // Parked into `pending`, not handed to the
                                     // SDK -- deliberately NOT tracked as
@@ -458,6 +512,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                                 }
                                 modeHash = msg.hash;
                                 mode = msg.mode;
+                                lastDeliveredMode = msg.mode;
                                 permissionHandler.handleModeChange(mode.permissionMode);
                                 sdkToLogConverter.updateSelectedModel(mode.model ?? null);
                                 deliveredMessageThisAttempt = true;
@@ -675,6 +730,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
     protected async cleanup(): Promise<void> {
         this.clearAbortHandlers(this.session.client.rpcHandlerManager);
+        this.autoContinue?.dispose();
+        this.idleCompactor?.dispose();
 
         if (this.handleSessionFound) {
             this.session.removeSessionFoundCallback(this.handleSessionFound);
