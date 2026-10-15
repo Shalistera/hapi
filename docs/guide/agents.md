@@ -285,6 +285,11 @@ overall permission policy.
 ## Other agents
 
 - **Claude Code** (`hapi claude`) — local sessions wrap the native TUI, remote sessions drive the Claude Agent SDK. [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code)
+
+  The Agent SDK does not run two of the TUI's background behaviors, so HAPI runs them for remote sessions. Both follow Claude Code's own settings:
+
+  - **Continue after a usage limit** — when a claude.ai usage limit stops a turn, HAPI continues the task a minute after the limit resets (if that is within six hours; weekly limits are not waited for). Sending a message first cancels it, and so does stopping the session. Turn it off with `"autoContinueAtUsageLimit": false` in Claude's `settings.json`.
+  - **Idle compaction** — a conversation over 200k tokens of context that sits idle for most of the one-hour prompt-cache lifetime (about 54 minutes) is compacted, so coming back later reprocesses only the summary. Claude then continues from that summary instead of the full context. It only runs when the conversation uses the one-hour cache. Turn it off with `"idleCompaction": false` (or `"autoCompactEnabled": false`, `DISABLE_COMPACT`, `DISABLE_AUTO_COMPACT`), and change the threshold with `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` (minimum 100k).
 - **Codex** (`hapi codex`) — OpenAI's Codex CLI, with terminal/Web control and a dedicated `plan` mode. See [Codex usage and limits](./codex-shared-sessions.md) for resume, terminal-exit behavior, and launch options. [openai/codex](https://github.com/openai/codex)
 - **GitHub Copilot** (`hapi copilot`) — Copilot CLI over ACP (`copilot --acp --stdio`). [GitHub Copilot](https://github.com/features/copilot)
 - **Kimi** (`hapi kimi`) — Moonshot AI's Kimi CLI over ACP (`kimi acp`). [MoonshotAI/kimi-cli](https://github.com/MoonshotAI/kimi-cli)

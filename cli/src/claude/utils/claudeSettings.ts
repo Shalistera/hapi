@@ -67,3 +67,33 @@ export function shouldIncludeCoAuthoredBy(): boolean {
   
   return settings.includeCoAuthoredBy;
 }
+function readSettingsFile(path: string): Record<string, unknown> | null {
+  try {
+    if (!existsSync(path)) return null;
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch (error) {
+    logger.debug(`[ClaudeSettings] Error reading ${path}: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * Read a boolean Claude Code setting the way Claude Code layers it: the
+ * project's .claude/settings.local.json, then .claude/settings.json, then the
+ * user's settings.json. Returns undefined when no layer sets a boolean.
+ */
+export function readClaudeBooleanSetting(key: string, projectDir: string): boolean | undefined {
+  const layers = [
+    join(projectDir, '.claude', 'settings.local.json'),
+    join(projectDir, '.claude', 'settings.json'),
+    getClaudeSettingsPath()
+  ];
+  for (const path of layers) {
+    const value = readSettingsFile(path)?.[key];
+    if (typeof value === 'boolean') return value;
+  }
+  return undefined;
+}
