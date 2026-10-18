@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, spyOn } from 'bun:test'
 import { Store } from '../store'
 import { RpcRegistry } from '../socket/rpcRegistry'
 import { SyncEngine } from './syncEngine'
+import { RpcGateway } from './rpcGateway'
 
 function createEngine() {
     const store = new Store(':memory:')
@@ -15,6 +16,73 @@ function createEngine() {
 }
 
 describe('SyncEngine.steerQueuedMessage', () => {
+    it('routes a remote OpenCode correction using its original localId', async () => {
+        const { store, engine } = createEngine()
+        const steer = spyOn(RpcGateway.prototype, 'steerQueuedMessage').mockResolvedValue({ steered: true })
+        try {
+            const session = engine.getOrCreateSession(
+                'steer-opencode',
+                { path: '/tmp/project', host: 'localhost', flavor: 'opencode' },
+                { requests: {}, completedRequests: {} },
+                'default'
+            )
+            const message = store.messages.addMessage(session.id, { text: 'correction' }, 'original-local')
+
+            expect(await engine.steerQueuedMessage(session.id, message.id)).toEqual({
+                status: 'steered', localId: 'original-local'
+            })
+            expect(steer).toHaveBeenCalledWith(session.id, 'original-local')
+        } finally {
+            steer.mockRestore()
+            engine.stop()
+        }
+    })
+
+    it('returns the persisted invoked row on a repeated OpenCode steer', async () => {
+        const { store, engine } = createEngine()
+        const steer = spyOn(RpcGateway.prototype, 'steerQueuedMessage')
+        try {
+            const session = engine.getOrCreateSession(
+                'steer-opencode-invoked',
+                { path: '/tmp/project', host: 'localhost', flavor: 'opencode' },
+                { requests: {}, completedRequests: {} },
+                'default'
+            )
+            const message = store.messages.addMessage(session.id, { text: 'correction' }, 'original-local')
+            store.messages.markMessagesInvoked(session.id, ['original-local'], 2_000)
+
+            expect(await engine.steerQueuedMessage(session.id, 'original-local')).toMatchObject({
+                status: 'invoked', message: { id: message.id, localId: 'original-local', invokedAt: 2_000 }
+            })
+            expect(steer).not.toHaveBeenCalled()
+        } finally {
+            steer.mockRestore()
+            engine.stop()
+        }
+    })
+
+    it('rejects a locally controlled OpenCode session before invoking the CLI', async () => {
+        const { store, engine } = createEngine()
+        const steer = spyOn(RpcGateway.prototype, 'steerQueuedMessage')
+        try {
+            const session = engine.getOrCreateSession(
+                'steer-opencode-local',
+                { path: '/tmp/project', host: 'localhost', flavor: 'opencode' },
+                { requests: {}, completedRequests: {}, controlledByUser: true },
+                'default'
+            )
+            const message = store.messages.addMessage(session.id, { text: 'correction' }, 'original-local')
+
+            expect(await engine.steerQueuedMessage(session.id, message.id)).toEqual({
+                status: 'failed', error: 'Steering is only available for remote sessions', localId: null
+            })
+            expect(steer).not.toHaveBeenCalled()
+        } finally {
+            steer.mockRestore()
+            engine.stop()
+        }
+    })
+
     it('rejects every scheduled row, mature ones included, without invoking the CLI', async () => {
         const { store, engine } = createEngine()
         try {

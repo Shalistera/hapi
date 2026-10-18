@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import type { OpencodeMode, PermissionMode } from './types';
+import type { PromptContent } from '@/agent/types';
 import { ACP_INDETERMINATE_SYMBOL } from '@/agent/backends/acp/AcpStdioTransport';
 
 const harness = vi.hoisted(() => ({
     setModelArgs: [] as Array<{ sessionId: string; modelId: string; flavor?: string }>,
     setConfigOptionArgs: [] as Array<{ sessionId: string; configId: string; value: string }>,
     promptCount: 0,
-    promptContents: [] as unknown[],
+    promptContents: [] as PromptContent[][],
     refreshSessionInfoCalls: [] as Array<{ sessionId: string; cwd: string }>,
     bridgeOptions: null as { enableChangeTitle?: boolean; skillLookup?: { workingDirectory: string; flavor: string } } | null,
     events: [] as string[],
@@ -124,7 +125,7 @@ vi.mock('./utils/opencodeBackend', () => ({
                 harness.thoughtLevelOption = { ...harness.thoughtLevelOption, currentValue: value };
             }
         }),
-        prompt: vi.fn(async (_sessionId: string, content: unknown[]) => {
+        prompt: vi.fn(async (_sessionId: string, content: PromptContent[]) => {
             harness.promptContents.push(content);
             harness.events.push('prompt:start');
             harness.promptCount++;
@@ -2692,6 +2693,33 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         }
     });
 
+    it('does not mistake a delayed foreground input for an identical steer receipt', async () => {
+        const receipts = await import('./utils/opencodeInputReceipt');
+        const receipt = vi.spyOn(receipts, 'fetchOpencodeUserMessages');
+        let releaseSoftSteer!: () => void;
+        harness.deferSoftSteer = new Promise<void>(resolve => { releaseSoftSteer = resolve; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        const foregroundText = harness.promptContents[0]
+            .filter(part => part.type === 'text').map(part => part.text).join('');
+        expect(foregroundText.length).toBeGreaterThan(0);
+        receipt.mockResolvedValueOnce([]).mockResolvedValue([{ id: 'late-foreground', text: foregroundText }]);
+        try {
+            stub.session.queue.push(foregroundText, createMode(), 'steer');
+            await steerHandlerOf(stub)({ localId: 'steer' });
+            expect(stub.emitMessagesConsumedCalls).toEqual([]);
+            expect(receipt).not.toHaveBeenCalled();
+            releaseSoftSteer();
+            await vi.waitFor(() => expect(stub.emitMessagesConsumedCalls).toEqual([
+                { localIds: ['steer'], options: { steered: true } }
+            ]));
+        } finally {
+            releaseSoftSteer();
+            receipt.mockRestore();
+            harness.deferSoftSteer = null;
+            await stopTurn(stub, releasePrompt, runPromise);
+        }
+    });
+
     it('rejects a steer while idle with no active turn', async () => {
         const stub = createSessionStub([], { keepOpen: true });
         const runPromise = opencodeRemoteLauncher(stub.session as never);
@@ -3182,11 +3210,36 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         await vi.waitFor(() => expect(stub.sessionEvents).toContainEqual({ type: 'ready' }));
         expect(stub.emitMessagesConsumedCalls).toEqual([]);
         expect(stub.steeringActiveCalls.at(-1)).toBe(false);
+        expect(stub.steerIndeterminateCalls).toEqual([['steer']]);
+        expect(stub.session.queue.cancelByLocalId('steer')).toBe(true);
 
         harness.deferSoftSteer = null;
         harness.promptImpl = null;
         stub.session.queue.close();
         await runPromise;
+    });
+
+    it('does not consume a replacement after an abandoned steer completes late', async () => {
+        let releaseSoftSteer!: () => void;
+        harness.deferSoftSteer = new Promise<void>(resolve => { releaseSoftSteer = resolve; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        try {
+            stub.session.queue.push('old correction', createMode(), 'steer');
+            await steerHandlerOf(stub)({ localId: 'steer' });
+            await (stub.rpcHandlers.get('abort') as () => Promise<void>)();
+            // Explicit Retry releases the old unknown reservation and queues
+            // a replacement with the same localId.
+            expect(stub.session.queue.cancelByLocalId('steer')).toBe(true);
+            stub.session.queue.push('replacement', createMode(), 'steer');
+            releaseSoftSteer();
+            await new Promise<void>(resolve => setImmediate(resolve));
+            expect(stub.emitMessagesConsumedCalls).toEqual([]);
+            expect(stub.session.queue.peekByLocalId('steer')?.message).toBe('replacement');
+        } finally {
+            releaseSoftSteer();
+            harness.deferSoftSteer = null;
+            await stopTurn(stub, releasePrompt, runPromise);
+        }
     });
 
     it('keeps the next prompt gated until a definite dispatch rejection is fully restored', async () => {
@@ -3516,7 +3569,7 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         await runPromise;
     });
 
-    it('handles a steer accepted before an abort exactly once', async () => {
+    it('acknowledges an abandoned steer exactly once when completion later proves acceptance', async () => {
         let releaseSoftSteer!: () => void;
         harness.deferSoftSteer = new Promise<void>((resolve) => { releaseSoftSteer = resolve; });
         const { stub, releasePrompt, runPromise } = await startTurn();
@@ -3534,7 +3587,9 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
             { localIds: ['steer'], options: { steered: true } }
         ));
         expect(stub.emitMessagesConsumedCalls.filter((call) => call.localIds.includes('steer'))).toHaveLength(1);
-        expect(stub.steerIndeterminateCalls).toEqual([]);
+        // Stop first exposes the unknown outcome for explicit resolution;
+        // late completion can still consume it if the user left it alone.
+        expect(stub.steerIndeterminateCalls).toEqual([['steer']]);
 
         harness.deferSoftSteer = null;
         await stopTurn(stub, releasePrompt, runPromise);

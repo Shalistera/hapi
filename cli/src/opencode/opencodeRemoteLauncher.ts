@@ -77,10 +77,13 @@ type CompactOperationPhase = 'idle' | 'snapshot' | 'summarize' | 'post-summarize
  *   the row's restore bookkeeping, which must continue to gate the drain.
  * - `release()` ends the launcher's wait without touching the ACP callbacks,
  *   so an accepted steer can still commit and acknowledge itself later.
+ * - `detach()` also makes an unanswered delivery explicitly resolvable. A
+ *   late callback may consume it only while it still owns that reservation.
  */
 type OpencodeSteerOperation = {
     settled: Promise<void>;
     transportPending: boolean;
+    detach: () => void;
     release: () => void;
 };
 
@@ -166,6 +169,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
     private promptInFlight = false;
     /** Mode hash of the prompt turn currently in flight; steers must match it. */
     private activePromptModeHash: string | null = null;
+    private activePromptText: string | null = null;
     /** Bumped synchronously by abort/cleanup/teardown; invalidates in-flight steer handlers. */
     private steerEpoch = 0;
     /**
@@ -743,6 +747,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
             // injected into a turn the agent is not running.
             this.promptInFlight = true;
             this.activePromptModeHash = batch.hash;
+            this.activePromptText = messageText;
             this.steerTurnEpoch += 1;
             // Advertise steerability so the web's queued-message Steer button
             // is reachable at all; only a normal active prompt may set it.
@@ -829,7 +834,11 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 // a prompt finishing during the durable-state await would
                 // drain an empty set and advance to the next batch while this
                 // row is still being restored.
-                const { operation, release: releaseOperation } = this.beginSteerOperation();
+                const { operation, release: releaseOperation } = this.beginSteerOperation(() => {
+                    if (session.queue.markReservationIndeterminate(taken)) {
+                        session.client.emitSteerIndeterminate([localId]);
+                    }
+                });
                 const receiptGeneration = this.nativeSteerReceiptGeneration;
 
                 const isControlItem = Boolean(taken.item.isolate) || taken.item.mode.operation !== undefined;
@@ -882,7 +891,11 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 // Snapshot before dispatch: an older identical prompt must not
                 // count as acceptance. Overlapping unproven steers cannot be
                 // correlated by text, so they retain completion-based ACKs.
+                // The foreground input itself may still be awaiting native
+                // persistence. If its text matches, a new id cannot prove
+                // which request was accepted; wait for completion instead.
                 const nativeBefore = this.pendingSteerAcceptances.size === 1
+                    && taken.item.message !== this.activePromptText
                     ? await fetchOpencodeUserMessages({ baseUrl: this.baseUrl, sessionId: acpSessionId })
                     : null;
                 // Recheck everything the durable/native-history awaits could
@@ -976,9 +989,11 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 let accepted = false;
                 const acknowledgeAcceptance = () => {
                     if (accepted) return;
+                    // Explicit resolution can release an abandoned request's
+                    // reservation before its late native completion arrives.
+                    if (!session.queue.commitReservation(taken)) return;
                     accepted = true;
                     this.pendingSteerAcceptances.delete(operation);
-                    session.queue.commitReservation(taken);
                     session.client.emitMessagesConsumed([localId], { steered: true });
                     this.messageBuffer.addMessage(taken.item.message, 'user');
                 };
@@ -1056,18 +1071,20 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
      * socket timeouts. Releasing those early would let the next prompt start
      * (and `ready` fire) while the row is still held, and the row would then
      * be restored *after* the next prompt, inverting FIFO. Their ACP callbacks
-     * stay attached either way, so a steer that was in fact accepted can still
-     * commit and acknowledge itself.
+     * stay attached either way. An unanswered delivery becomes indeterminate,
+     * so explicit Cancel/Retry can release it; late acceptance may commit only
+     * while that request still owns the reservation.
      */
     private closeSteerGate(options?: { detachStrandedSteers?: boolean }): void {
         this.steerEpoch++;
         this.promptInFlight = false;
         this.activePromptModeHash = null;
+        this.activePromptText = null;
         this.setSteeringActive(false);
         if (options?.detachStrandedSteers === true) {
             for (const operation of Array.from(this.pendingSteerOperations)) {
                 if (operation.transportPending) {
-                    operation.release();
+                    operation.detach();
                 }
             }
         }
@@ -1090,7 +1107,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
      * that can strand its ACP request — either way the ACP callbacks attached
      * to that request stay alive.
      */
-    private beginSteerOperation(): {
+    private beginSteerOperation(onDetach: () => void): {
         operation: OpencodeSteerOperation;
         release: () => void;
     } {
@@ -1098,6 +1115,10 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
         const operation: OpencodeSteerOperation = {
             settled: new Promise<void>((resolve) => { settle = resolve; }),
             transportPending: false,
+            detach: () => {
+                onDetach();
+                operation.release();
+            },
             release: () => {}
         };
         this.pendingSteerOperations.add(operation);
