@@ -3242,6 +3242,78 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         }
     });
 
+    it.each(['resolve', 'reject'] as const)('keeps a fresh attempt owned when an abandoned explicit steer retry reports %s', async outcome => {
+        let resolveOld!: () => void;
+        let rejectOld!: (error: Error) => void;
+        harness.deferSoftSteer = new Promise<void>((resolve, reject) => { resolveOld = resolve; rejectOld = reject; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        let releaseSecond: (() => void) | undefined;
+        let resolveNew: (() => void) | undefined;
+        try {
+            stub.session.queue.push('correction', createMode(), 'steer');
+            await steerHandlerOf(stub)({ localId: 'steer' });
+            await (stub.rpcHandlers.get('abort') as () => Promise<void>)();
+            releasePrompt();
+            harness.promptImpl = () => new Promise<void>(resolve => { releaseSecond = resolve; });
+            stub.session.queue.push('second foreground', createMode(), 'second');
+            await vi.waitFor(() => expect(harness.promptCount).toBe(2));
+            harness.deferSoftSteer = new Promise<void>(resolve => { resolveNew = resolve; });
+            await expect(steerHandlerOf(stub)({ localId: 'steer' })).resolves.toEqual({ steered: true });
+            if (outcome === 'resolve') resolveOld();
+            else rejectOld(new Error('old attempt failed late'));
+            await new Promise<void>(resolve => setImmediate(resolve));
+            expect(stub.emitMessagesConsumedCalls).toEqual([]);
+            expect(stub.steerIndeterminateCalls).toEqual([['steer']]);
+            expect(stub.session.queue.cancelByLocalId('steer')).toBe('in-flight');
+            resolveNew!();
+            await vi.waitFor(() => expect(stub.emitMessagesConsumedCalls).toEqual([
+                { localIds: ['steer'], options: { steered: true } }
+            ]));
+        } finally {
+            resolveOld(); resolveNew?.(); releaseSecond?.();
+            harness.deferSoftSteer = null;
+            await stopTurn(stub, releasePrompt, runPromise);
+        }
+    });
+
+    it.each(['foreground', 'steer'] as const)('does not treat an abandoned %s late native save as a newer steer receipt', async writer => {
+        const receipts = await import('./utils/opencodeInputReceipt');
+        const receipt = vi.spyOn(receipts, 'fetchOpencodeUserMessages').mockResolvedValue(null);
+        let resolveOld!: () => void;
+        harness.deferSoftSteer = new Promise<void>(resolve => { resolveOld = resolve; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        let releaseSecond: (() => void) | undefined;
+        let resolveNew: (() => void) | undefined;
+        try {
+            const text = writer === 'foreground'
+                ? harness.promptContents[0].filter(part => part.type === 'text').map(part => part.text).join('')
+                : 'same correction';
+            if (writer === 'steer') {
+                stub.session.queue.push(text, createMode(), 'old-steer');
+                await steerHandlerOf(stub)({ localId: 'old-steer' });
+            }
+            await (stub.rpcHandlers.get('abort') as () => Promise<void>)();
+            releasePrompt();
+            harness.promptImpl = () => new Promise<void>(resolve => { releaseSecond = resolve; });
+            stub.session.queue.push('second foreground', createMode(), 'second');
+            await vi.waitFor(() => expect(harness.promptCount).toBe(2));
+            receipt.mockReset().mockResolvedValueOnce([]).mockResolvedValue([{ id: 'old-attempt-native-id', text }]);
+            harness.deferSoftSteer = new Promise<void>(resolve => { resolveNew = resolve; });
+            stub.session.queue.push(text, createMode(), 'new-steer');
+            await steerHandlerOf(stub)({ localId: 'new-steer' });
+            expect(stub.emitMessagesConsumedCalls).toEqual([]);
+            expect(receipt).not.toHaveBeenCalled();
+            resolveNew!();
+            await vi.waitFor(() => expect(stub.emitMessagesConsumedCalls).toEqual([
+                { localIds: ['new-steer'], options: { steered: true } }
+            ]));
+        } finally {
+            resolveOld(); resolveNew?.(); releaseSecond?.();
+            receipt.mockRestore(); harness.deferSoftSteer = null;
+            await stopTurn(stub, releasePrompt, runPromise);
+        }
+    });
+
     it('keeps the next prompt gated until a definite dispatch rejection is fully restored', async () => {
         const { stub, releasePrompt, runPromise } = await startTurn();
         stub.session.queue.push('mid-turn correction', createMode(), 'steer');

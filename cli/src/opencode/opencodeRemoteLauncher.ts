@@ -191,6 +191,9 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
     private pendingSteerOperations = new Set<OpencodeSteerOperation>();
     private pendingSteerAcceptances = new Set<OpencodeSteerOperation>();
     private nativeSteerReceiptGeneration = 0;
+    // An abandoned native writer can save input after a later snapshot. Once
+    // correlation is lost, this native context needs completion-based ACKs.
+    private nativeSteerReceiptCorrelationLost = false;
     /**
      * Soft requests the ACP backend is still counting, keyed by identity so a
      * late completion callback can only release *its own* entry and never
@@ -834,11 +837,13 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 // a prompt finishing during the durable-state await would
                 // drain an empty set and advance to the next batch while this
                 // row is still being restored.
-                const { operation, release: releaseOperation } = this.beginSteerOperation(() => {
+                const markUncertainNativeDelivery = () => {
+                    this.nativeSteerReceiptCorrelationLost = true;
                     if (session.queue.markReservationIndeterminate(taken)) {
                         session.client.emitSteerIndeterminate([localId]);
                     }
-                });
+                };
+                const { operation, release: releaseOperation } = this.beginSteerOperation(markUncertainNativeDelivery);
                 const receiptGeneration = this.nativeSteerReceiptGeneration;
 
                 const isControlItem = Boolean(taken.item.isolate) || taken.item.mode.operation !== undefined;
@@ -894,7 +899,8 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 // The foreground input itself may still be awaiting native
                 // persistence. If its text matches, a new id cannot prove
                 // which request was accepted; wait for completion instead.
-                const nativeBefore = this.pendingSteerAcceptances.size === 1
+                const nativeBefore = !this.nativeSteerReceiptCorrelationLost
+                    && this.pendingSteerAcceptances.size === 1
                     && taken.item.message !== this.activePromptText
                     ? await fetchOpencodeUserMessages({ baseUrl: this.baseUrl, sessionId: acpSessionId })
                     : null;
@@ -947,9 +953,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                     });
                 } catch (error) {
                     if (isAcpIndeterminateError(error)) {
-                        if (session.queue.markReservationIndeterminate(taken)) {
-                            session.client.emitSteerIndeterminate([localId]);
-                        }
+                        markUncertainNativeDelivery();
                         logger.debug('[opencode-remote] soft-steer dispatch outcome unknown', error);
                         releaseOperation();
                         return { steered: false, error: 'Steer outcome is being reconciled' };
@@ -968,9 +972,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                     await steer.dispatched;
                 } catch (error) {
                     if (isAcpIndeterminateError(error)) {
-                        if (session.queue.markReservationIndeterminate(taken)) {
-                            session.client.emitSteerIndeterminate([localId]);
-                        }
+                        markUncertainNativeDelivery();
                         logger.debug('[opencode-remote] soft-steer dispatch outcome unknown', error);
                         releaseOperation();
                         return { steered: false, error: 'Steer outcome is being reconciled' };
@@ -1007,6 +1009,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                     const previousIds = new Set(nativeBefore.map(message => message.id));
                     const deadline = Date.now() + 3_000;
                     while (!accepted && Date.now() < deadline
+                        && !this.nativeSteerReceiptCorrelationLost
                         && this.steerEpoch === steerEpoch
                         && this.backend === backend
                         && this.activeAcpSessionId === acpSessionId
@@ -1017,7 +1020,8 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                             sessionId: acpSessionId,
                             signal: AbortSignal.timeout(Math.max(1, deadline - Date.now()))
                         });
-                        if (this.steerEpoch !== steerEpoch
+                        if (this.nativeSteerReceiptCorrelationLost
+                            || this.steerEpoch !== steerEpoch
                             || this.backend !== backend
                             || this.activeAcpSessionId !== acpSessionId
                             || this.nativeSteerReceiptGeneration !== receiptGeneration) return;
@@ -1042,9 +1046,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                     if (accepted) return;
                     // ACP provider errors may arrive after native input acceptance.
                     // Without a receipt, dispatch completion cannot prove rejection.
-                    if (session.queue.markReservationIndeterminate(taken)) {
-                        session.client.emitSteerIndeterminate([localId]);
-                    }
+                    markUncertainNativeDelivery();
                     logger.debug('[opencode-remote] soft-steer outcome unknown after dispatch; row held for explicit resolution', error);
                 }).finally(() => {
                     releaseOperation();
@@ -1076,6 +1078,11 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
      * while that request still owns the reservation.
      */
     private closeSteerGate(options?: { detachStrandedSteers?: boolean }): void {
+        if (options?.detachStrandedSteers && this.promptInFlight) {
+            // A normal foreground request can also still be awaiting native
+            // persistence when Stop/stall releases its turn.
+            this.nativeSteerReceiptCorrelationLost = true;
+        }
         this.steerEpoch++;
         this.promptInFlight = false;
         this.activePromptModeHash = null;
