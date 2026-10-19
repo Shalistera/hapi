@@ -507,6 +507,9 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
             // `batch.mode.model` semantics: a string is a specific model id;
             // `null` means "reset to whatever model the backend launched with"
             // (emitted by `/model default`); `undefined` means "no change".
+            // Preserve Default's null queue intent when display mode resolves
+            // to a concrete model; only a rollback changes that intent.
+            let steeringModel = batch.mode.model;
             const requestedModel = batch.mode.model === null
                 ? this.defaultBackendModel
                 : batch.mode.model;
@@ -517,6 +520,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
             } else if (requestedModel && requestedModel !== this.currentBackendModel) {
                 if (!backend.setModel || this.setModelSupported === false) {
                     this.rollbackModel(batch, this.currentBackendModel);
+                    steeringModel = batch.mode.model;
                 } else {
                     logger.debug(`[opencode-remote] Switching model inline: ${this.currentBackendModel} -> ${requestedModel}`);
                     try {
@@ -554,6 +558,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                             });
                         }
                         this.rollbackModel(batch, this.currentBackendModel);
+                        steeringModel = batch.mode.model;
                     }
                 }
             }
@@ -749,7 +754,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
             // false, so a steer arriving during either is rejected rather than
             // injected into a turn the agent is not running.
             this.promptInFlight = true;
-            this.activePromptModeHash = batch.hash;
+            this.activePromptModeHash = session.queue.modeHasher({ ...batch.mode, model: steeringModel });
             this.activePromptText = messageText;
             this.steerTurnEpoch += 1;
             // Advertise steerability so the web's queued-message Steer button

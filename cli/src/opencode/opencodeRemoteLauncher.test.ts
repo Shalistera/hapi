@@ -2820,6 +2820,110 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         await stopTurn(stub, releasePrompt, runPromise);
     });
 
+    it.each(['model rejection', 'effort rejection', 'unsupported effort', 'coerced effort'] as const)(
+        'steers with the resolved settings after %s',
+        async (scenario) => {
+            const modelFailure = scenario === 'model rejection';
+            const requested = modelFailure ? createMode('ollama/b') : createModeWithEffort(undefined, 'high');
+            const resolved = modelFailure ? createMode('ollama/a') : createModeWithEffort(undefined, 'low');
+            harness.sessionModelsMetadata = { currentModelId: 'ollama/a', availableModels: [] };
+            if (modelFailure) {
+                harness.setModelImpl = async () => { throw new Error('Model unavailable'); };
+            } else {
+                harness.thoughtLevelOption = {
+                    id: 'effort',
+                    currentValue: scenario === 'coerced effort' ? 'high' : 'low',
+                    options: scenario === 'effort rejection'
+                        ? [{ value: 'low' }, { value: 'high' }]
+                        : [{ value: 'low' }, { value: 'medium' }]
+                };
+                if (scenario === 'coerced effort') requested.modelReasoningEffort = 'max';
+                if (scenario === 'effort rejection') {
+                    harness.setConfigOptionImpl = async () => { throw new Error('Effort unavailable'); };
+                }
+            }
+            const { stub, releasePrompt, runPromise } = await startTurn({ firstMode: requested });
+            try {
+                if (modelFailure) {
+                    expect(stub.setModel).toHaveBeenCalledWith('ollama/a');
+                } else {
+                    expect(stub.setModelReasoningEffort).toHaveBeenCalledWith('low');
+                }
+                stub.session.queue.push('resolved correction', resolved, 'steer');
+                await expect(steerHandlerOf(stub)({ localId: 'steer' })).resolves.toEqual({ steered: true });
+                await vi.waitFor(() => expect(stub.emitMessagesConsumedCalls).toContainEqual({
+                    localIds: ['steer'], options: { steered: true }
+                }));
+                expect(harness.softSteerCalls).toEqual([{
+                    sessionId: 'acp-session-1', content: [{ type: 'text', text: 'resolved correction' }]
+                }]);
+                expect(harness.promptCount).toBe(1);
+                expect(stub.session.queue.cancelByLocalId('steer')).toBe('consumed');
+
+                // The original request still differs from the running turn.
+                const stale = modelFailure ? createMode('ollama/b') : createModeWithEffort(undefined, 'high');
+                stub.session.queue.push('stale settings', stale, 'stale');
+                await expect(steerHandlerOf(stub)({ localId: 'stale' })).resolves.toEqual({
+                    steered: false,
+                    error: 'Queued message mode differs from the active turn'
+                });
+                expect(harness.softSteerCalls).toHaveLength(1);
+                expect(stub.session.queue.cancelByLocalId('stale')).toBe(true);
+            } finally {
+                harness.setModelImpl = null;
+                harness.setConfigOptionImpl = null;
+                harness.setModelArgs = [];
+                harness.setConfigOptionArgs = [];
+                await stopTurn(stub, releasePrompt, runPromise);
+            }
+        }
+    );
+
+    it.each([false, true])('preserves Default model intent after a successful reset with effort rejection=%s', async (rejectEffort) => {
+        harness.sessionModelsMetadata = { currentModelId: 'ollama/default', availableModels: [] };
+        harness.thoughtLevelOption = {
+            id: 'effort', currentValue: 'low', options: [{ value: 'low' }, { value: 'high' }]
+        };
+        if (rejectEffort) {
+            harness.setConfigOptionImpl = async () => { throw new Error('Effort unavailable'); };
+        }
+        let releasePrompt!: () => void;
+        harness.promptImpl = async () => {
+            if (harness.promptCount === 2) await new Promise<void>(resolve => { releasePrompt = resolve; });
+        };
+        const requested = rejectEffort ? { ...createResetMode(), modelReasoningEffort: 'high' } : createResetMode();
+        const resolved = rejectEffort ? { ...createResetMode(), modelReasoningEffort: 'low' } : createResetMode();
+        const stub = createSessionStub([
+            { message: 'first', mode: createMode('ollama/custom'), localId: 'first' },
+            { message: 'reset', mode: requested, localId: 'reset' }
+        ], { keepOpen: true });
+        const runPromise = opencodeRemoteLauncher(stub.session as never);
+        try {
+            await vi.waitFor(() => expect(harness.promptCount).toBe(2));
+            expect(harness.setModelArgs).toEqual([
+                { sessionId: 'acp-session-1', modelId: 'ollama/custom', flavor: 'opencode' },
+                { sessionId: 'acp-session-1', modelId: 'ollama/default', flavor: 'opencode' }
+            ]);
+            if (rejectEffort) expect(stub.setModelReasoningEffort).toHaveBeenCalledWith('low');
+            stub.session.queue.push('Default correction', resolved, 'steer');
+            await expect(steerHandlerOf(stub)({ localId: 'steer' })).resolves.toEqual({ steered: true });
+            await vi.waitFor(() => expect(stub.emitMessagesConsumedCalls).toContainEqual({
+                localIds: ['steer'], options: { steered: true }
+            }));
+            expect(harness.softSteerCalls).toEqual([{
+                sessionId: 'acp-session-1', content: [{ type: 'text', text: 'Default correction' }]
+            }]);
+        } finally {
+            harness.setConfigOptionImpl = null;
+            harness.setModelArgs = [];
+            harness.setConfigOptionArgs = [];
+            harness.promptImpl = null;
+            releasePrompt?.();
+            stub.session.queue.close();
+            await runPromise;
+        }
+    });
+
     it('rejects a normal steer while a compaction is in flight', async () => {
         harness.sessionModelsMetadata = { currentModelId: 'ollama/x', availableModels: [] };
         let releaseCompact!: () => void;
