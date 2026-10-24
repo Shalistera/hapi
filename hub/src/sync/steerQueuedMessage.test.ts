@@ -16,6 +16,30 @@ function createEngine() {
 }
 
 describe('SyncEngine.steerQueuedMessage', () => {
+    it.each(['negative reply', 'lost reply'] as const)('returns the consumed row when a %s races native acceptance', async (outcome) => {
+        const { store, engine } = createEngine()
+        const session = engine.getOrCreateSession(
+            'steer-racing-acceptance',
+            { path: '/tmp/project', host: 'localhost', flavor: 'opencode' },
+            { requests: {}, completedRequests: {} }, 'default'
+        )
+        const message = store.messages.addMessage(session.id, { text: 'correction' }, 'accepted-local')
+        const steer = spyOn(RpcGateway.prototype, 'steerQueuedMessage').mockImplementation(async () => {
+            store.messages.markMessagesInvoked(session.id, ['accepted-local'], 2_000)
+            if (outcome === 'lost reply') throw new Error('operation has timed out')
+            return { steered: false, error: 'Message not in queue' }
+        })
+        try {
+            expect(await engine.steerQueuedMessage(session.id, message.id)).toMatchObject({
+                status: 'invoked', message: { id: message.id, localId: 'accepted-local', invokedAt: 2_000 }
+            })
+            expect(steer).toHaveBeenCalledTimes(1)
+        } finally {
+            steer.mockRestore()
+            engine.stop()
+        }
+    })
+
     it('routes a remote OpenCode correction using its original localId', async () => {
         const { store, engine } = createEngine()
         const steer = spyOn(RpcGateway.prototype, 'steerQueuedMessage').mockResolvedValue({ steered: true })
@@ -32,6 +56,27 @@ describe('SyncEngine.steerQueuedMessage', () => {
                 status: 'steered', localId: 'original-local'
             })
             expect(steer).toHaveBeenCalledWith(session.id, 'original-local')
+        } finally {
+            steer.mockRestore()
+            engine.stop()
+        }
+    })
+
+    it.each(['queued', 'dispatching', 'indeterminate'] as const)('does not infer invocation from a failed RPC while the row is %s', async (state) => {
+        const { store, engine } = createEngine()
+        const session = engine.getOrCreateSession(
+            'steer-unconfirmed',
+            { path: '/tmp/project', host: 'localhost', flavor: 'opencode' },
+            { requests: {}, completedRequests: {} }, 'default'
+        )
+        const message = store.messages.addMessage(session.id, { text: 'correction' }, 'unconfirmed-local')
+        store.messages.setMessagesDeliveryState(session.id, ['unconfirmed-local'], state)
+        const steer = spyOn(RpcGateway.prototype, 'steerQueuedMessage').mockRejectedValue(new Error('operation has timed out'))
+        try {
+            expect(await engine.steerQueuedMessage(session.id, message.id)).toEqual({
+                status: 'failed', error: 'operation has timed out', localId: 'unconfirmed-local'
+            })
+            expect(store.messages.lookupQueuedMessage(session.id, message.id).status).not.toBe('invoked')
         } finally {
             steer.mockRestore()
             engine.stop()

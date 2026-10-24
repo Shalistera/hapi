@@ -2613,6 +2613,103 @@ describe('opencodeRemoteLauncher mid-turn steer', () => {
         await stopTurn(stub, releasePrompt, runPromise);
     });
 
+    it('acknowledges dispatch without waiting for a pending native receipt lookup', async () => {
+        const receipts = await import('./utils/opencodeInputReceipt');
+        let releaseReceipt!: () => void;
+        const pendingReceipt = new Promise<Array<{ id: string; text: string }>>(resolve => {
+            releaseReceipt = () => resolve([{ id: 'accepted', text: 'correction' }]);
+        });
+        const receipt = vi.spyOn(receipts, 'fetchOpencodeUserMessages')
+            .mockResolvedValueOnce([]).mockReturnValue(pendingReceipt);
+        let releaseSoftSteer!: () => void;
+        harness.deferSoftSteer = new Promise<void>(resolve => { releaseSoftSteer = resolve; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        let response: unknown;
+        let steering: Promise<unknown> | undefined;
+        try {
+            stub.session.queue.push('correction', createMode(), 'steer');
+            steering = steerHandlerOf(stub)({ localId: 'steer' }).then(result => { response = result; });
+            await vi.waitFor(() => expect(receipt).toHaveBeenCalledTimes(2));
+            expect(response).toEqual({ steered: true });
+            expect(stub.emitMessagesConsumedCalls).toEqual([]);
+            releaseReceipt();
+            await vi.waitFor(() => expect(stub.emitMessagesConsumedCalls).toEqual([
+                { localIds: ['steer'], options: { steered: true } }
+            ]));
+        } finally {
+            releaseReceipt();
+            releaseSoftSteer();
+            await steering;
+            receipt.mockRestore();
+            harness.deferSoftSteer = null;
+            await stopTurn(stub, releasePrompt, runPromise);
+        }
+    });
+
+    it.each(['delayed persistence', 'transient history failure'] as const)(
+        'consumes a proven native receipt after %s before the turn finishes', async (scenario) => {
+            const receipts = await import('./utils/opencodeInputReceipt');
+            const realNow = Date.now.bind(Date);
+            let time: ReturnType<typeof vi.spyOn> | undefined;
+            const receipt = vi.spyOn(receipts, 'fetchOpencodeUserMessages')
+                .mockResolvedValueOnce([])
+                .mockImplementationOnce(async () => {
+                    if (scenario === 'delayed persistence') {
+                        time = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 4_000);
+                        return [];
+                    }
+                    return null;
+                })
+                .mockResolvedValue([{ id: 'accepted', text: 'correction' }]);
+            let releaseSoftSteer!: () => void;
+            harness.deferSoftSteer = new Promise<void>(resolve => { releaseSoftSteer = resolve; });
+            const { stub, releasePrompt, runPromise } = await startTurn();
+            try {
+                stub.session.queue.push('correction', createMode(), 'steer');
+                await expect(steerHandlerOf(stub)({ localId: 'steer' })).resolves.toEqual({ steered: true });
+                await vi.waitFor(() => expect(stub.emitMessagesConsumedCalls).toEqual([
+                    { localIds: ['steer'], options: { steered: true } }
+                ]));
+                expect(harness.promptCount).toBe(1);
+                expect(harness.events).not.toContain('prompt:end');
+                expect(stub.session.queue.cancelByLocalId('steer')).toBe('consumed');
+            } finally {
+                time?.mockRestore();
+                releaseSoftSteer();
+                receipt.mockRestore();
+                harness.deferSoftSteer = null;
+                await stopTurn(stub, releasePrompt, runPromise);
+            }
+        }
+    );
+
+    it('stops receipt polling when an unconfirmed native request fails', async () => {
+        const receipts = await import('./utils/opencodeInputReceipt');
+        const receipt = vi.spyOn(receipts, 'fetchOpencodeUserMessages')
+            .mockResolvedValueOnce([]).mockResolvedValue(null);
+        let rejectSoftSteer!: (error: Error) => void;
+        harness.deferSoftSteer = new Promise<void>((_resolve, reject) => { rejectSoftSteer = reject; });
+        const { stub, releasePrompt, runPromise } = await startTurn();
+        try {
+            stub.session.queue.push('correction', createMode(), 'steer');
+            await expect(steerHandlerOf(stub)({ localId: 'steer' })).resolves.toEqual({ steered: true });
+            await vi.waitFor(() => expect(receipt.mock.calls.length).toBeGreaterThan(1));
+            rejectSoftSteer(new Error('provider failed without an input receipt'));
+            await vi.waitFor(() => expect(stub.steerIndeterminateCalls).toEqual([['steer']]));
+            const reads = receipt.mock.calls.length;
+            await new Promise(resolve => setTimeout(resolve, 150));
+            expect(receipt).toHaveBeenCalledTimes(reads);
+            expect(stub.emitMessagesConsumedCalls).toEqual([]);
+            expect(stub.session.queue.cancelByLocalId('steer')).toBe(true);
+        } finally {
+            rejectSoftSteer(new Error('cleanup'));
+            await stub.rpcHandlers.get('abort')?.({});
+            receipt.mockRestore();
+            harness.deferSoftSteer = null;
+            await stopTurn(stub, releasePrompt, runPromise);
+        }
+    });
+
     it('consumes an input accepted in native history before its concurrent prompt completes', async () => {
         const receipts = await import('./utils/opencodeInputReceipt');
         const text = 'mid-turn correction';

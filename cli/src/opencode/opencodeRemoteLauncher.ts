@@ -1012,8 +1012,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 const nativeReceipt = (async () => {
                     if (!nativeBefore) return;
                     const previousIds = new Set(nativeBefore.map(message => message.id));
-                    const deadline = Date.now() + 3_000;
-                    while (!accepted && Date.now() < deadline
+                    while (!accepted && operation.transportPending
                         && !this.nativeSteerReceiptCorrelationLost
                         && this.steerEpoch === steerEpoch
                         && this.backend === backend
@@ -1022,18 +1021,16 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                         && this.pendingSteerAcceptances.has(operation)) {
                         const nativeMessages = await fetchOpencodeUserMessages({
                             baseUrl: this.baseUrl,
-                            sessionId: acpSessionId,
-                            signal: AbortSignal.timeout(Math.max(1, deadline - Date.now()))
+                            sessionId: acpSessionId
                         });
                         if (this.nativeSteerReceiptCorrelationLost
                             || this.steerEpoch !== steerEpoch
                             || this.backend !== backend
                             || this.activeAcpSessionId !== acpSessionId
                             || this.nativeSteerReceiptGeneration !== receiptGeneration) return;
-                        if (!nativeMessages) return;
-                        const matches = nativeMessages.filter(message =>
+                        const matches = nativeMessages?.filter(message =>
                             !previousIds.has(message.id) && message.text === taken.item.message
-                        );
+                        ) ?? [];
                         if (matches.length === 1) {
                             acknowledgeAcceptance();
                             return;
@@ -1056,7 +1053,9 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                 }).finally(() => {
                     releaseOperation();
                 });
-                await nativeReceipt;
+                // Native persistence is independent of the transport ACK. Keep
+                // reconciling while this request owns the active turn, without
+                // holding the hub RPC open or inferring acceptance from dispatch.
                 return { steered: true };
             }
         );
