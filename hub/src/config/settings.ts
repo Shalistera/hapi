@@ -51,6 +51,11 @@ export interface Settings {
      * Env vars still win when set at process start (ops override).
      */
     providerCredentials?: Partial<Record<string, string>>
+    /**
+     * Cap (seconds) on one ElevenLabs ConvAI conversation. Env
+     * ELEVENLABS_MAX_DURATION_SECONDS still wins when set at process start.
+     */
+    elevenLabsMaxDurationSeconds?: number
 }
 
 export function getSettingsFile(dataDir: string): string {

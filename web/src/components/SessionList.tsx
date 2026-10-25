@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import * as Popover from '@radix-ui/react-popover'
 import { SessionListScrollAnchor } from './SessionListScrollAnchor'
 import type { SessionSummary } from '@/types/api'
 import { SESSION_LIFECYCLE_IDLE } from '@hapi/protocol'
@@ -26,6 +27,55 @@ function PinnedSectionIcon(props: { className?: string }) {
             <path d="M5 17h14" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" />
             <path d="M7 4V2h10v2l-2 5v4l2 2H7l2-2V9Z" />
         </svg>
+    )
+}
+
+function MoreHorizontalIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+            aria-hidden="true"
+        >
+            <circle cx="5" cy="12" r="1.5" fill="currentColor" stroke="none" />
+            <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+            <circle cx="19" cy="12" r="1.5" fill="currentColor" stroke="none" />
+        </svg>
+    )
+}
+
+/** Narrow-header overflow for shed secondary actions (tiann/hapi#2039). */
+function SessionListHeaderOverflow(props: { children: ReactNode }) {
+    const { t } = useTranslation()
+    return (
+        <Popover.Root>
+            <Popover.Trigger asChild>
+                <button
+                    type="button"
+                    data-testid="session-list-header-overflow"
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                    title={t('sessions.toolbar.more')}
+                    aria-label={t('sessions.toolbar.more')}
+                >
+                    <MoreHorizontalIcon className="h-5 w-5" />
+                </button>
+            </Popover.Trigger>
+            <Popover.Portal>
+                <Popover.Content
+                    align="end"
+                    sideOffset={6}
+                    className="z-50 flex max-w-[min(100vw-1rem,20rem)] flex-wrap items-center justify-end gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-1.5 shadow-xl"
+                >
+                    {props.children}
+                </Popover.Content>
+            </Popover.Portal>
+        </Popover.Root>
     )
 }
 import { cn } from '@/lib/utils'
@@ -62,6 +112,35 @@ import { Spinner } from '@/components/Spinner'
 import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { useToast } from '@/lib/toast-context'
 import { getPathDisplayName } from '@/utils/path'
+import {
+    shedToolbarSlots,
+    toolbarActionBudget,
+    TOOLBAR_GAP_PX,
+    TOOLBAR_ICON_PX,
+    TOOLBAR_MORE_PX,
+    type ToolbarShedSlot
+} from '@/components/sessionToolbarShed'
+
+/** Hit targets that must stay visible: icon, clear, calendar. Not the query text. */
+function measureSearchChrome(search: HTMLElement): number {
+    const parts = [...search.querySelectorAll<HTMLElement>('[data-toolbar-chrome]')]
+    if (parts.length === 0) return search.offsetWidth
+    const gap = Number.parseFloat(getComputedStyle(search).columnGap) || 0
+    const trigger = search.querySelector('button')
+    const triggerStyle = trigger ? getComputedStyle(trigger) : null
+    const triggerPad = triggerStyle
+        ? (Number.parseFloat(triggerStyle.paddingLeft) || 0) + (Number.parseFloat(triggerStyle.paddingRight) || 0)
+        : 0
+    return parts.reduce((sum, el) => sum + el.offsetWidth, 0) + triggerPad + gap * Math.max(0, parts.length - 1)
+}
+
+export type SessionToolbarExtra = {
+    id: string
+    /** Higher sheds into More first. See sessionToolbarShed.ts. */
+    keep: number
+    node: ReactNode
+    widthPx?: number
+}
 
 export { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
 
@@ -747,6 +826,13 @@ export function SessionListSearch(props: {
     onDateRangeChange: (start: string, end: string) => void
     expanded: boolean
     onExpandedChange: (expanded: boolean) => void
+    /** Minimum width of icon + clear + calendar. Query text may shrink; these may not. */
+    chromeMinPx?: number
+    /**
+     * Caps the collapsed query group so machine menu + More stay in the row.
+     * The 9rem chip is a ceiling, not a reservation (#2040).
+     */
+    maxWidthPx?: number
 }) {
     const { t } = useTranslation()
     const [datePickerOpen, setDatePickerOpen] = useState(false)
@@ -763,83 +849,133 @@ export function SessionListSearch(props: {
         }
     }, [props.expanded])
 
-    const renderDateFilter = (variant: 'standalone' | 'embedded') => {
-        const returnFocus = () => {
-            (variant === 'embedded' ? inputRef.current : dateButtonRef.current)?.focus()
+    const returnDateFocus = () => {
+        if (props.expanded) {
+            inputRef.current?.focus()
+            return
         }
-
-        return (
-            <>
-                <button
-                    ref={dateButtonRef}
-                    type="button"
-                    onClick={() => setDatePickerOpen(open => !open)}
-                    className={cn(
-                        'relative shrink-0 transition-colors hover:bg-[var(--app-subtle-bg)]',
-                        variant === 'standalone'
-                            ? 'rounded-full p-1.5 hover:text-[var(--app-fg)]'
-                            : 'flex items-center rounded-r-lg rounded-l-md px-1',
-                        hasDateRange ? 'text-[var(--app-link)]' : 'text-[var(--app-hint)]'
-                    )}
-                    title={hasDateRange ? `${props.customStart} – ${props.customEnd}` : t('sessions.timeFilter.label')}
-                    aria-label={hasDateRange
-                        ? `${t('sessions.timeFilter.label')}: ${props.customStart} – ${props.customEnd}`
-                        : t('sessions.timeFilter.label')}
-                    aria-expanded={datePickerOpen}
-                >
-                    <CalendarIcon className="h-5 w-5" />
-                    {hasDateRange ? (
-                        <span className={cn(
-                            'absolute h-1.5 w-1.5 rounded-full bg-[var(--app-link)]',
-                            variant === 'standalone' ? 'right-0.5 top-0.5' : 'right-1 top-1'
-                        )} />
-                    ) : null}
-                </button>
-                {datePickerOpen ? (
-                    <>
-                        <button
-                            type="button"
-                            aria-label={t('sessions.timeFilter.close')}
-                            className="fixed inset-0 z-20 cursor-default"
-                            onClick={() => {
-                                setDatePickerOpen(false)
-                                returnFocus()
-                            }}
-                        />
-                        <SessionDateRangePicker
-                            start={props.customStart}
-                            end={props.customEnd}
-                            sessionActivityDates={props.sessionActivityDates}
-                            onChange={props.onDateRangeChange}
-                            onClear={() => {
-                                props.onDateRangeChange('', '')
-                                // The footer Clear button unmounts once the range is
-                                // empty; return focus so it does not drop to <body>.
-                                returnFocus()
-                            }}
-                            onClose={() => {
-                                setDatePickerOpen(false)
-                                returnFocus()
-                            }}
-                            align={variant === 'standalone' ? 'left' : 'right'}
-                        />
-                    </>
-                ) : null}
-            </>
-        )
+        dateButtonRef.current?.focus()
     }
+
+    // Layout A (#2019 / Quest): calendar sits INSIDE the expanded field,
+    // immediately left of the furthest-right 48px clear end-cap. Both hit
+    // targets are min 48x48 so the clear is no longer a ~14px absolute X.
+    // Date button only — picker mounts on the search-group container so
+    // left-0 / right-0 stay viewport-safe (not a 48px button containing block).
+    const renderDateButton = (variant: 'standalone' | 'embedded') => (
+        <div className={cn('shrink-0', variant === 'embedded' && 'flex items-stretch')}>
+            <button
+                ref={dateButtonRef}
+                type="button"
+                data-testid={variant === 'embedded'
+                    ? 'session-list-search-date-embedded'
+                    : 'session-list-search-date-standalone'}
+                data-toolbar-chrome=""
+                onClick={() => setDatePickerOpen(open => !open)}
+                className={cn(
+                    'relative flex shrink-0 items-center justify-center transition-colors',
+                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] focus-visible:ring-inset',
+                    variant === 'standalone'
+                        ? cn(
+                            'min-h-[48px] min-w-[48px] rounded-full p-2',
+                            'hover:bg-[var(--app-subtle-bg)]',
+                            hasDateRange ? 'text-[var(--app-link)]' : 'text-[var(--app-hint)] hover:text-[var(--app-fg)]'
+                        )
+                        : cn(
+                            'session-list-search-date-embedded min-h-[48px] min-w-[48px] border-l border-[var(--app-border)]',
+                            'hover:bg-[var(--app-subtle-bg)]',
+                            hasDateRange ? 'text-[var(--app-link)]' : 'text-[var(--app-hint)] hover:text-[var(--app-fg)]'
+                        )
+                )}
+                title={hasDateRange
+                    ? `${props.customStart} - ${props.customEnd}`
+                    : t('sessions.timeFilter.label')}
+                aria-label={hasDateRange
+                    ? `${t('sessions.timeFilter.label')}: ${props.customStart} - ${props.customEnd}`
+                    : t('sessions.timeFilter.label')}
+                aria-expanded={datePickerOpen}
+            >
+                <CalendarIcon className="h-5 w-5 shrink-0" />
+                {hasDateRange ? (
+                    <span
+                        className={cn(
+                            'absolute h-1.5 w-1.5 rounded-full bg-[var(--app-link)]',
+                            variant === 'standalone' ? 'right-1 top-1' : 'right-1.5 top-1.5'
+                        )}
+                        aria-hidden="true"
+                    />
+                ) : null}
+            </button>
+        </div>
+    )
+
+    const datePicker = datePickerOpen ? (
+        <>
+            <button
+                type="button"
+                aria-label={t('sessions.timeFilter.close')}
+                className="fixed inset-0 z-20 cursor-default"
+                onClick={() => {
+                    setDatePickerOpen(false)
+                    returnDateFocus()
+                }}
+            />
+            <SessionDateRangePicker
+                start={props.customStart}
+                end={props.customEnd}
+                sessionActivityDates={props.sessionActivityDates}
+                onChange={props.onDateRangeChange}
+                onClear={() => {
+                    props.onDateRangeChange('', '')
+                    // The footer Clear button unmounts once the range is
+                    // empty; return focus so it does not drop to <body>.
+                    returnDateFocus()
+                }}
+                onClose={() => {
+                    setDatePickerOpen(false)
+                    returnDateFocus()
+                }}
+                align={props.expanded ? 'right' : 'left'}
+            />
+        </>
+    ) : null
 
     const searchLabel = t('sessions.search.open')
 
     if (!props.expanded) {
         const hasTextQuery = props.value.length > 0
         const collapsedLabel = hasTextQuery ? `${searchLabel}: ${props.value}` : searchLabel
+        // Idle: shrink-0 so the icon does not crush under neighbors (#2039).
+        // Active query: maxWidth reserves machine menu + More before the 9rem
+        // chip can take ~240px and shove More off a 320px / 130% row (#2040).
+        const chromeFloor = hasTextQuery && props.chromeMinPx && props.chromeMinPx > 0
+            ? props.chromeMinPx
+            : 0
+        const reservedCap = hasTextQuery && props.maxWidthPx && props.maxWidthPx > 0
+            ? Math.max(props.maxWidthPx, chromeFloor)
+            : 0
         return (
-            <div className="relative flex items-center gap-1">
+            <div
+                data-testid="session-list-search"
+                data-expanded="false"
+                style={chromeFloor > 0 || reservedCap > 0
+                    ? {
+                        ...(chromeFloor > 0 ? { minWidth: chromeFloor } : {}),
+                        ...(reservedCap > 0 ? { maxWidth: reservedCap } : {}),
+                    }
+                    : undefined}
+                className={cn(
+                    'relative flex max-w-full flex-nowrap items-center gap-1',
+                    // Query text shrinks. minWidth is the icon/clear/calendar floor
+                    // so a flex-1 actions box cannot crush those hit targets.
+                    hasTextQuery ? 'min-w-0 max-w-full shrink' : 'shrink-0'
+                )}
+            >
                 <div className={cn(
                     'relative flex min-w-0 items-center rounded-full transition-colors',
                     hasTextQuery
                         // Keep the query and its clear action inside the same compact chip.
+                        // Cap stays modest so [chip][⋯] fits a 320px phone (#2039 Major).
                         ? 'max-w-[9rem] bg-[var(--app-chat-user-chip-bg)] text-[var(--app-chat-user-chip-fg)]'
                         : 'shrink-0'
                 )}>
@@ -848,15 +984,17 @@ export function SessionListSearch(props: {
                         type="button"
                         onClick={() => props.onExpandedChange(true)}
                         className={cn(
-                            'relative flex min-w-0 items-center gap-1 transition-colors',
+                            'relative flex min-h-[40px] items-center gap-1 transition-colors',
                             hasTextQuery
-                                ? 'flex-1 rounded-l-full bg-[var(--app-chat-user-chip-bg)] px-2 py-1 text-[var(--app-chat-user-chip-fg)] hover:opacity-90'
-                                : 'shrink-0 rounded-full p-1.5 text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]'
+                                ? 'min-w-0 flex-1 rounded-l-full bg-[var(--app-chat-user-chip-bg)] px-2 py-1 text-[var(--app-chat-user-chip-fg)] hover:opacity-90'
+                                : 'min-w-[40px] shrink-0 rounded-full p-2 text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]'
                         )}
                         title={collapsedLabel}
                         aria-label={collapsedLabel}
                     >
-                        <SearchIcon className="h-5 w-5 shrink-0" />
+                        <span data-toolbar-chrome="" className="inline-flex shrink-0">
+                            <SearchIcon className="h-5 w-5 shrink-0" />
+                        </span>
                         {hasTextQuery ? (
                             <span className="min-w-0 truncate text-xs font-medium">{props.value}</span>
                         ) : null}
@@ -870,21 +1008,25 @@ export function SessionListSearch(props: {
                                 // the collapsed search trigger instead of dropping to body.
                                 collapsedButtonRef.current?.focus()
                             }}
-                            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-r-full bg-[var(--app-chat-user-chip-action-bg)] text-[var(--app-chat-user-chip-action-fg)] transition-colors hover:text-[var(--app-chat-user-chip-action-hover-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] focus-visible:ring-inset"
+                            data-toolbar-chrome=""
+                            className="flex h-10 w-10 min-h-[40px] min-w-[40px] shrink-0 items-center justify-center rounded-r-full bg-[var(--app-chat-user-chip-action-bg)] text-[var(--app-chat-user-chip-action-fg)] transition-colors hover:text-[var(--app-chat-user-chip-action-hover-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] focus-visible:ring-inset"
                             title={t('sessions.search.clear')}
                             aria-label={t('sessions.search.clear')}
                         >
-                            <XIcon className="h-3.5 w-3.5" />
+                            <XIcon className="h-4 w-4" />
                         </button>
                     ) : null}
                 </div>
-                {renderDateFilter('standalone')}
+                {renderDateButton('standalone')}
+                {datePicker}
             </div>
         )
     }
 
     return (
         <div
+            data-testid="session-list-search"
+            data-expanded="true"
             className="relative min-w-0 flex-1"
             onBlur={(event) => {
                 if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
@@ -892,40 +1034,39 @@ export function SessionListSearch(props: {
                 }
             }}
         >
-            <div className="pointer-events-none absolute inset-y-0 left-2.5 flex items-center text-[var(--app-hint)]">
-                <SearchIcon className="h-3.5 w-3.5" />
+            <div className="relative flex min-h-12 min-w-0 items-stretch rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] transition-colors focus-within:border-[var(--app-link)]">
+                <div className="pointer-events-none flex shrink-0 items-center pl-2.5 text-[var(--app-hint)]">
+                    <SearchIcon className="h-3.5 w-3.5" />
+                </div>
+                <input
+                    ref={inputRef}
+                    type="search"
+                    value={props.value}
+                    onChange={(event) => props.onChange(event.target.value)}
+                    placeholder={t('sessions.search.placeholder')}
+                    aria-label={searchLabel}
+                    title={searchLabel}
+                    className="min-w-0 flex-1 appearance-none bg-transparent px-2 py-1.5 text-sm text-[var(--app-fg)] outline-none placeholder:text-[var(--app-hint)] [text-overflow:ellipsis] [&::-webkit-search-cancel-button]:hidden [&::-webkit-search-decoration]:hidden"
+                />
+                {renderDateButton('embedded')}
+                {props.value ? (
+                    <button
+                        type="button"
+                        onClick={() => {
+                            props.onChange('')
+                            // The clear button unmounts with the query; keep focus off <body>
+                            // so a later outside click still routes blur through the wrapper.
+                            inputRef.current?.focus()
+                        }}
+                        className="session-list-search-clear-endcap flex min-h-[48px] min-w-[48px] shrink-0 items-center justify-center border-l border-[var(--app-border)] bg-[var(--app-subtle-bg)] text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] focus-visible:ring-inset"
+                        title={t('sessions.search.clear')}
+                        aria-label={t('sessions.search.clear')}
+                    >
+                        <XIcon className="h-5 w-5" />
+                    </button>
+                ) : null}
             </div>
-            <input
-                ref={inputRef}
-                type="search"
-                value={props.value}
-                onChange={(event) => props.onChange(event.target.value)}
-                placeholder={t('sessions.search.placeholder')}
-                aria-label={searchLabel}
-                title={searchLabel}
-                className={cn(
-                    'w-full appearance-none rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] py-1.5 pl-8 text-sm text-[var(--app-fg)] outline-none transition-colors placeholder:text-[var(--app-hint)] [text-overflow:ellipsis] focus:border-[var(--app-link)] [&::-webkit-search-cancel-button]:hidden [&::-webkit-search-decoration]:hidden',
-                    props.value ? 'pr-16' : 'pr-7'
-                )}
-            />
-            {props.value ? (
-                <button
-                    type="button"
-                    onClick={() => {
-                        props.onChange('')
-                        // The clear button unmounts with the query; keep focus off <body>
-                        // so a later outside click still routes blur through the wrapper.
-                        inputRef.current?.focus()
-                    }}
-                    className="absolute inset-y-0 right-9 flex items-center rounded p-0.5 text-[var(--app-hint)] hover:text-[var(--app-fg)]"
-                    title={t('sessions.search.clear')}
-                >
-                    <XIcon className="h-3.5 w-3.5" />
-                </button>
-            ) : null}
-            <div className="absolute inset-y-0 right-0 flex items-stretch">
-                {renderDateFilter('embedded')}
-            </div>
+            {datePicker}
         </div>
     )
 }
@@ -1215,7 +1356,9 @@ export function SessionList(props: {
     onRefresh: () => Promise<unknown> | void
     isLoading: boolean
     renderHeader?: boolean
+    /** @deprecated Prefer `toolbarExtras` so each control has its own keep rank. */
     headerActions?: React.ReactNode
+    toolbarExtras?: SessionToolbarExtra[]
     api: ApiClient | null
     titleSuggestionAvailable?: boolean
     machineLabelsById?: Record<string, string>
@@ -1247,6 +1390,60 @@ export function SessionList(props: {
     const [customEnd, setCustomEnd] = useState('')
     const [markAllReadOpen, setMarkAllReadOpen] = useState(false)
     const [, setCodexImportedSessionsVersion] = useState(0)
+    // Actions-box width is the real icon budget (#2039). Measuring the full
+    // row and subtracting a guessed search reserve left empty space after More.
+    const headerRowRef = useRef<HTMLDivElement>(null)
+    const headerActionsRef = useRef<HTMLDivElement>(null)
+    const toolbarMeasureRef = useRef<HTMLDivElement>(null)
+    const machineMenuRef = useRef<HTMLDivElement>(null)
+    const actionsObserverRef = useRef<ResizeObserver | null>(null)
+    const [headerRowWidth, setHeaderRowWidth] = useState(0)
+    const [toolbarSlotWidths, setToolbarSlotWidths] = useState<Record<string, number>>({})
+    const [toolbarChrome, setToolbarChrome] = useState({ morePx: TOOLBAR_MORE_PX, gapPx: TOOLBAR_GAP_PX, machinePx: 0 })
+    const [searchChromePx, setSearchChromePx] = useState(0)
+    const [searchMaxPx, setSearchMaxPx] = useState(0)
+    // jsdom reports clientWidth 0; the row observer publishes the stubbed width.
+    const [toolbarRowBoxPx, setToolbarRowBoxPx] = useState(0)
+    // Search expand unmounts the actions box. A callback ref re-observes the
+    // new node when search collapses; an effect keyed only on showHeaderRow does not.
+    const setHeaderActionsNode = useCallback((node: HTMLDivElement | null) => {
+        headerActionsRef.current = node
+        actionsObserverRef.current?.disconnect()
+        actionsObserverRef.current = null
+        // Search expand unmounts this node — keep the last positive width so
+        // we do not fall back to a permissive unmeasured budget mid-cycle.
+        if (!node || typeof ResizeObserver === 'undefined') return
+        const publishActions = (reported = 0) => {
+            // flex-1 allocation, not the icon cluster's intrinsic width and not
+            // the previous expanded-search layout (#2040).
+            const allocated = node.clientWidth
+            const width = allocated > 0 ? allocated : reported
+            if (width > 0) setHeaderRowWidth(width)
+        }
+        const ro = new ResizeObserver((entries) => {
+            let actionsWidth = 0
+            let sawActions = false
+            for (const entry of entries) {
+                const target = entry.target
+                const reported = entry.contentRect.width ?? 0
+                const client = target instanceof HTMLElement ? target.clientWidth : 0
+                const width = client > 0 ? client : reported
+                if (target === headerRowRef.current && target !== node && width > 0) {
+                    setToolbarRowBoxPx((previous) => previous === width ? previous : width)
+                }
+                if (target === node) {
+                    sawActions = true
+                    actionsWidth = width
+                }
+            }
+            if (sawActions) publishActions(actionsWidth)
+        })
+        ro.observe(node)
+        const row = headerRowRef.current
+        if (row && row !== node) ro.observe(row)
+        actionsObserverRef.current = ro
+        publishActions(node.clientWidth || node.getBoundingClientRect().width)
+    }, [])
     const normalizedQuery = normalizeSearch(searchQuery)
     const timeRange = getSessionTimeRange(customStart, customEnd)
     const isFiltering = normalizedQuery.length > 0 || timeRange !== null
@@ -1824,7 +2021,58 @@ export function SessionList(props: {
         if (!showSearch) setSearchExpanded(false)
     }, [showSearch])
 
-    const showHeaderRow = showSearch || renderHeader || Boolean(props.headerActions)
+    const showHeaderRow = showSearch || renderHeader || Boolean(props.headerActions) || Boolean(props.toolbarExtras?.length)
+
+    useEffect(() => () => {
+        actionsObserverRef.current?.disconnect()
+    }, [])
+    useLayoutEffect(() => {
+        const search = headerRowRef.current?.querySelector<HTMLElement>('[data-testid="session-list-search"]')
+        const nextChrome = search && search.dataset.expanded !== 'true'
+            ? measureSearchChrome(search)
+            : 0
+        setSearchChromePx((previous) => previous === nextChrome ? previous : nextChrome)
+        const root = toolbarMeasureRef.current
+        if (!root) return
+        const next: Record<string, number> = {}
+        for (const node of root.querySelectorAll<HTMLElement>('[data-measure-id]')) {
+            const id = node.dataset.measureId
+            if (!id || id === '__more') continue
+            const width = node.offsetWidth
+            if (width > 0) next[id] = width
+        }
+        setToolbarSlotWidths((previous) => {
+            const previousKeys = Object.keys(previous)
+            const nextKeys = Object.keys(next)
+            if (previousKeys.length === nextKeys.length && nextKeys.every((key) => previous[key] === next[key])) {
+                return previous
+            }
+            return next
+        })
+        const moreNode = root.querySelector<HTMLElement>('[data-measure-id="__more"]')
+        const parsedGap = Number.parseFloat(getComputedStyle(root).columnGap)
+        const morePx = moreNode && moreNode.offsetWidth > 0 ? moreNode.offsetWidth : TOOLBAR_MORE_PX
+        const gapPx = Number.isFinite(parsedGap) && parsedGap > 0 ? parsedGap : TOOLBAR_GAP_PX
+        const machinePx = machineMenuRef.current?.offsetWidth ?? 0
+        setToolbarChrome((previous) => (
+            previous.morePx === morePx && previous.gapPx === gapPx && previous.machinePx === machinePx
+                ? previous
+                : { morePx, gapPx, machinePx }
+        ))
+        // Search may use a 9rem chip. Reserve padding + gap + visible machine
+        // menu + More so that chip cannot eat the trailing controls (#2040).
+        const row = headerRowRef.current
+        const rowBox = row && row.clientWidth > 0 ? row.clientWidth : toolbarRowBoxPx
+        const rowStyle = row ? getComputedStyle(row) : null
+        const rowPad = rowStyle
+            ? (Number.parseFloat(rowStyle.paddingLeft) || 0) + (Number.parseFloat(rowStyle.paddingRight) || 0)
+            : 0
+        const trailing = gapPx
+            + (machinePx > 0 ? machinePx + gapPx : 0)
+            + morePx
+        const nextSearchMax = rowBox > 0 ? Math.max(0, rowBox - rowPad - trailing) : 0
+        setSearchMaxPx((previous) => previous === nextSearchMax ? previous : nextSearchMax)
+    })
 
     // Pull-to-refresh on the scrollable list. Touch-only gesture mirroring the
     // pull-to-load-older pattern in HappyThread; desktop has no overscroll
@@ -1920,7 +2168,15 @@ export function SessionList(props: {
         <div className="flex min-h-0 w-full flex-1 flex-col">
             <div className="session-list-scrollbar-offset mx-auto w-full max-w-content shrink-0">
             {showHeaderRow ? (
-                <div className="flex items-center gap-1 px-2 py-1">
+                // One toolbar row always. Never flex-wrap: wrapping burned a whole
+                // line on Quest when the icon slab did not fit beside search
+                // (tiann/hapi#2039). Secondary chrome sheds via container query
+                // instead of taking a second row.
+                <div
+                    ref={headerRowRef}
+                    data-testid="session-list-header-row"
+                    className="@container flex min-w-0 w-full flex-nowrap items-center gap-1 px-2 py-1"
+                >
                     {showSearch ? (
                         <SessionListSearch
                             value={searchQuery}
@@ -1934,66 +2190,178 @@ export function SessionList(props: {
                             }}
                             expanded={searchExpanded}
                             onExpandedChange={setSearchExpanded}
+                            chromeMinPx={searchQuery.length > 0 ? searchChromePx : 0}
+                            maxWidthPx={searchQuery.length > 0 ? searchMaxPx : 0}
                         />
                     ) : null}
                     {!(showSearch && searchExpanded) ? (
-                        <>
-                            <div className="flex-1" />
-                            {showMachineFilterBar ? (
-                                <MachineFilterMenu
-                                    machines={machineFilterItems}
-                                    totalCount={allSessions.length}
-                                    value={activeMachineFilter}
-                                    onChange={setMachineFilter}
-                                />
-                            ) : null}
-                            {unreadSessionCount > 0 ? (
-                                <button
-                                    type="button"
-                                    onClick={() => setMarkAllReadOpen(true)}
-                                    title={t('sessions.markAllRead.button', { count: unreadSessionCount })}
-                                    aria-label={t('sessions.markAllRead.button', { count: unreadSessionCount })}
-                                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
-                                >
-                                    <MarkAllReadIcon className="h-5 w-5" />
-                                </button>
-                            ) : null}
-                            <button
-                                type="button"
-                                onClick={() => setShowUnreadOnly(!showUnreadOnly)}
-                                aria-pressed={showUnreadOnly}
-                                title={t('sessions.unreadFilter.toggle')}
-                                aria-label={t('sessions.unreadFilter.toggle')}
-                                className={cn(
-                                    'flex h-9 w-9 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]',
-                                    showUnreadOnly
-                                        ? 'bg-[var(--app-subtle-bg)]'
-                                        : 'hover:bg-[var(--app-subtle-bg)]'
-                                )}
-                            >
-                                {/* Same shape/color language as session-row unread dots (SessionAttentionIndicator). */}
-                                <span
-                                    aria-hidden
-                                    className={cn(
-                                        'inline-flex h-2.5 w-2.5 shrink-0 rounded-full',
-                                        showUnreadOnly
-                                            ? 'bg-[var(--app-link)]'
-                                            : 'bg-[var(--app-hint)]'
-                                    )}
-                                />
-                            </button>
-                            {renderHeader ? (
-                                <button
-                                    type="button"
-                                    onClick={props.onNewSession}
-                                    className="session-list-new-button flex h-9 w-9 items-center justify-center rounded-full text-[var(--app-link)] transition-colors"
-                                    title={t('sessions.new')}
-                                >
-                                    <PlusIcon className="h-5 w-5" />
-                                </button>
-                            ) : null}
-                            {props.headerActions}
-                        </>
+                        <div
+                            ref={setHeaderActionsNode}
+                            data-testid="session-list-header-actions"
+                            // flex-1 min-w-0: the box is the row's leftover after search
+                            // chrome, not the width of whatever icons are already
+                            // showing. shrink-0 made that leftover follow the
+                            // cluster and search overlapped (#2040).
+                            className="relative flex min-w-0 flex-1 flex-nowrap items-center gap-1"
+                        >
+                            {(() => {
+                                // Shed one control at a time, highest keep first.
+                                // Do not ml-auto a lone ⋯ across empty space, and do
+                                // not fold the whole row at a single width gate (#2039).
+                                const machineAndGap = toolbarChrome.machinePx > 0
+                                    ? toolbarChrome.machinePx + toolbarChrome.gapPx
+                                    : 0
+                                // Prefer the flex allocation. It tracks the row, not the
+                                // icons already on it. If they all fit, More is empty.
+                                const allocated = headerActionsRef.current?.clientWidth ?? 0
+                                const gutter = allocated > 0
+                                    ? allocated
+                                    : headerRowWidth > 0
+                                        ? headerRowWidth
+                                        : 0
+                                const budget = gutter > 0
+                                    ? Math.max(0, gutter - machineAndGap)
+                                    : toolbarActionBudget(0, searchQuery.length > 0)
+                                const slotWidth = (id: string, fallback: number) => {
+                                    const measured = toolbarSlotWidths[id] ?? 0
+                                    return measured > 0 ? measured : fallback
+                                }
+                                const definedSlots: Array<ToolbarShedSlot & { node: ReactNode }> = []
+                                if (unreadSessionCount > 0) {
+                                    definedSlots.push({
+                                        id: 'mark-all',
+                                        keep: 7,
+                                        widthPx: slotWidth('mark-all', TOOLBAR_ICON_PX),
+                                        node: (
+                                            <button
+                                                type="button"
+                                                onClick={() => setMarkAllReadOpen(true)}
+                                                title={t('sessions.markAllRead.button', { count: unreadSessionCount })}
+                                                aria-label={t('sessions.markAllRead.button', { count: unreadSessionCount })}
+                                                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                                            >
+                                                <MarkAllReadIcon className="h-5 w-5" />
+                                            </button>
+                                        )
+                                    })
+                                }
+                                definedSlots.push({
+                                    id: 'unread',
+                                    keep: 5,
+                                    widthPx: slotWidth('unread', TOOLBAR_ICON_PX),
+                                    node: (
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowUnreadOnly(!showUnreadOnly)}
+                                            aria-pressed={showUnreadOnly}
+                                            title={t('sessions.unreadFilter.toggle')}
+                                            aria-label={t('sessions.unreadFilter.toggle')}
+                                            className={cn(
+                                                'flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]',
+                                                showUnreadOnly
+                                                    ? 'bg-[var(--app-subtle-bg)]'
+                                                    : 'hover:bg-[var(--app-subtle-bg)]'
+                                            )}
+                                        >
+                                            <span
+                                                aria-hidden
+                                                className={cn(
+                                                    'inline-flex h-2.5 w-2.5 shrink-0 rounded-full',
+                                                    showUnreadOnly
+                                                        ? 'bg-[var(--app-link)]'
+                                                        : 'bg-[var(--app-hint)]'
+                                                )}
+                                            />
+                                        </button>
+                                    )
+                                })
+                                if (renderHeader) {
+                                    definedSlots.push({
+                                        id: 'new',
+                                        keep: 4,
+                                        widthPx: slotWidth('new', TOOLBAR_ICON_PX),
+                                        node: (
+                                            <button
+                                                type="button"
+                                                onClick={props.onNewSession}
+                                                className="session-list-new-button flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--app-link)] transition-colors"
+                                                title={t('sessions.new')}
+                                            >
+                                                <PlusIcon className="h-5 w-5" />
+                                            </button>
+                                        )
+                                    })
+                                }
+                                for (const extra of props.toolbarExtras ?? []) {
+                                    definedSlots.push({
+                                        id: extra.id,
+                                        keep: extra.keep,
+                                        widthPx: slotWidth(extra.id, extra.widthPx ?? TOOLBAR_ICON_PX),
+                                        node: extra.node
+                                    })
+                                }
+                                if (props.headerActions) {
+                                    definedSlots.push({
+                                        id: 'header-actions',
+                                        keep: 6,
+                                        widthPx: slotWidth('header-actions', TOOLBAR_ICON_PX),
+                                        node: props.headerActions
+                                    })
+                                }
+                                const { visibleIds, overflowIds } = shedToolbarSlots(definedSlots, budget, {
+                                    morePx: toolbarChrome.morePx,
+                                    gapPx: toolbarChrome.gapPx
+                                })
+                                const byId = new Map(definedSlots.map((slot) => [slot.id, slot]))
+                                const visible = visibleIds.map((id) => byId.get(id)).filter((slot) => slot != null)
+                                const overflow = overflowIds.map((id) => byId.get(id)).filter((slot) => slot != null)
+                                return (
+                                    <>
+                                        <div
+                                            ref={toolbarMeasureRef}
+                                            aria-hidden
+                                            inert
+                                            className="pointer-events-none absolute left-0 top-0 -z-10 flex h-0 w-max gap-1 overflow-hidden opacity-0"
+                                        >
+                                            {definedSlots.map((slot) => (
+                                                <span key={slot.id} data-measure-id={slot.id} className="inline-flex shrink-0">
+                                                    {slot.node}
+                                                </span>
+                                            ))}
+                                            <span data-measure-id="__more" className="inline-flex h-9 w-9 shrink-0" />
+                                        </div>
+                                        {showMachineFilterBar ? (
+                                            <div
+                                                ref={machineMenuRef}
+                                                data-testid="session-list-header-machine-menu"
+                                                className="inline-flex shrink-0"
+                                            >
+                                                <MachineFilterMenu
+                                                    machines={machineFilterItems}
+                                                    totalCount={allSessions.length}
+                                                    value={activeMachineFilter}
+                                                    onChange={setMachineFilter}
+                                                />
+                                            </div>
+                                        ) : null}
+                                        {visible.map((slot) => (
+                                            <span key={slot.id} data-testid={`session-toolbar-slot-${slot.id}`} className="contents">
+                                                {slot.node}
+                                            </span>
+                                        ))}
+                                        {overflow.length > 0 ? (
+                                            <SessionListHeaderOverflow>
+                                                {overflow.map((slot) => (
+                                                    <span key={slot.id} data-testid={`session-toolbar-slot-${slot.id}`} className="contents">
+                                                        {slot.node}
+                                                    </span>
+                                                ))}
+                                            </SessionListHeaderOverflow>
+                                        ) : null}
+                                    </>
+                                )
+                            })()}
+                        </div>
                     ) : null}
                 </div>
             ) : null}
