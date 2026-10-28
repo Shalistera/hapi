@@ -115,6 +115,27 @@ describe('SDKToLogConverter', () => {
 
             expect(converter.convert(sdkMessage)?.isMeta).toBeUndefined()
         })
+
+        it.each([
+            '<local-command-stdout>Compacted </local-command-stdout>',
+            '<local-command-name>/context</local-command-name>',
+            '<local-command-stdout>context window usage</local-command-stdout>',
+            '<local-command-stderr>boom</local-command-stderr>'
+        ])('keeps other local-command CLI output visible for the client contract (%s)', (content) => {
+            // Local-command output is rendered intentionally as a CLI-output
+            // block (docs/api/client-contract/messages.md). The compact stdout
+            // echo is suppressed upstream, in claudeRemote's stream loop, where
+            // the active-command state lives.
+            const sdkMessage: SDKUserMessage = {
+                type: 'user',
+                message: {
+                    role: 'user',
+                    content
+                }
+            }
+
+            expect(converter.convert(sdkMessage)?.isMeta).toBeUndefined()
+        })
     })
 
     describe('Assistant messages', () => {
@@ -159,6 +180,23 @@ describe('SDKToLogConverter', () => {
 
             expect((logMessage as any).requestId).toBe('req_123')
         })
+
+        it('keeps the top-level error on synthetic API error messages (#1857)', () => {
+            const sdkMessage: any = {
+                type: 'assistant',
+                message: {
+                    model: '<synthetic>',
+                    role: 'assistant',
+                    content: [{ type: 'text', text: 'Prompt is too long' }]
+                },
+                error: 'invalid_request',
+                is_api_error_message: true
+            }
+
+            const logMessage = converter.convert(sdkMessage)
+
+            expect((logMessage as any).error).toBe('invalid_request')
+        })
     })
 
     describe('System messages', () => {
@@ -201,6 +239,17 @@ describe('SDKToLogConverter', () => {
 
             const logMessage = converter.convert(userMessage)
             expect(logMessage?.sessionId).toBe('updated-session-789')
+        })
+
+        it('keeps the task list on background_tasks_changed snapshots', () => {
+            const tasks = [{ task_id: 'b1', task_type: 'local_bash' }]
+            const logMessage = converter.convert({
+                type: 'system',
+                subtype: 'background_tasks_changed',
+                tasks
+            } as SDKSystemMessage)
+
+            expect(logMessage).toMatchObject({ type: 'system', subtype: 'background_tasks_changed', tasks })
         })
     })
 
@@ -393,6 +442,33 @@ describe('SDKToLogConverter', () => {
             // Subsequent assistant message uses the refined value
             const second = converter.convert(makeAssistantMessage()) as any
             expect(second?.message?.usage?.context_window).toBe(500_000)
+        })
+
+        it('exposes the resolved context window for the post-compaction usage refresh', () => {
+            // No init/result yet: the launcher's context-only usage must not
+            // invent a window, so the getter stays undefined.
+            expect(converter.currentContextWindow()).toBeUndefined()
+
+            converter.convert({
+                type: 'system',
+                subtype: 'init',
+                session_id: 'session-cw',
+                model: 'claude-opus-4-7[1m]'
+            } as SDKSystemMessage)
+            expect(converter.currentContextWindow()).toBe(1_000_000)
+
+            converter.convert({
+                type: 'result',
+                subtype: 'success',
+                num_turns: 1,
+                total_cost_usd: 0,
+                duration_ms: 1,
+                duration_api_ms: 1,
+                is_error: false,
+                session_id: 'session-cw',
+                modelUsage: { 'claude-opus-4-7[1m]': { contextWindow: 500_000 } }
+            } as SDKResultMessage)
+            expect(converter.currentContextWindow()).toBe(500_000)
         })
 
         it('does not overwrite an explicit context_window already set by upstream', () => {

@@ -374,7 +374,7 @@ final class NewSessionModel {
             return .managed
         }
         if NewSessionLogic.usesNativePermissionSelect(agent) {
-            return .nativeSelect(agent.launchPermissionModes.map { PermissionModeOption(mode: $0) })
+            return .nativeSelect(agent.permissionModes.map { PermissionModeOption(mode: $0) })
         }
         return .yoloToggle(nativeModeLabel: NewSessionLogic.hapiYoloNativeMode(for: agent)?.label)
     }

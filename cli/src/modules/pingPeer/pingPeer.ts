@@ -1,28 +1,33 @@
 /**
  * Resume-if-inactive + wait-active + POST /api/sessions/:id/messages,
- * plus read-only inspectPeer (GET session + messages, never resume).
+ * plus read-only inspectPeer (GET session + messages, never resume)
+ * and setPeerPermissionMode (POST /api/sessions/:id/permission-mode).
  *
- * Shared by `hapi ping-peer` / `hapi inspect-peer` and MCP `ping_peer` /
- * `inspect_peer`. Uses the same hub JWT flow as the web app
+ * Shared by `hapi ping-peer` / `hapi inspect-peer` / `hapi set-mode` and MCP
+ * `ping_peer` / `inspect_peer`. Uses the same hub JWT flow as the web app
  * (`POST /api/auth` with CLI_API_TOKEN), scoped to the token's namespace.
  * Callers must not invent parallel auth or arbitrary hosts.
  */
 
 import axios, { type AxiosInstance } from 'axios'
-import { extractAssistantPlainText, isObject } from '@hapi/protocol'
+import { randomUUID } from 'node:crypto'
+import { extractAssistantPlainText, getPermissionModesForFlavor, isObject } from '@hapi/protocol'
 import { normalizeSessionIdPrefix } from '@hapi/protocol/sessionCitation'
 import { configuration } from '@/configuration'
+import { isPeerToolsDisabled } from '@/modules/common/peerTools'
 import { getAuthToken } from '@/api/auth'
 import { buildHubRequestHeaders } from '@/api/hubExtraHeaders'
 
 export type PingPeerErrorCode =
     | 'bad_args'
+    | 'disabled'
     | 'auth_failed'
     | 'not_found'
     | 'ambiguous'
     | 'resume_failed'
     | 'timeout'
     | 'send_failed'
+    | 'apply_failed'
 
 export class PingPeerError extends Error {
     readonly code: PingPeerErrorCode
@@ -31,6 +36,20 @@ export class PingPeerError extends Error {
         super(message)
         this.name = 'PingPeerError'
         this.code = code
+    }
+}
+
+/**
+ * Defense-in-depth gate for HAPI_DISABLE_PEER_TOOLS: the MCP server and CLI
+ * surface refuse earlier, but any other caller (stale --tools bridge, shell
+ * `hapi ping-peer` from a wrapped agent) lands here and fails loudly.
+ */
+function assertPeerToolsEnabled(): void {
+    if (isPeerToolsDisabled()) {
+        throw new PingPeerError(
+            'disabled',
+            'peer session tools are disabled on this machine (HAPI_DISABLE_PEER_TOOLS is set)'
+        )
     }
 }
 
@@ -65,6 +84,23 @@ export type PingPeerResult = {
     sessionId: string
     name: string
     resumed: boolean
+    /**
+     * Known client submit identity for the peer row (`ping-peer-` prefix).
+     * The recipient runtime's consumption ACK is the only delivery proof;
+     * HTTP success below means hub-accepted, which may race that ACK.
+     */
+    localId: string
+}
+
+/**
+ * localId prefix for peer submissions. The recipient hub exempts these rows
+ * from the session-end synthetic sweep, preserving unconsumed peer messages
+ * for replay and keeping invocation timestamps tied to consumption ACKs.
+ */
+export const PEER_MESSAGE_LOCAL_ID_PREFIX = 'ping-peer-'
+
+export function createPeerMessageLocalId(): string {
+    return `${PEER_MESSAGE_LOCAL_ID_PREFIX}${randomUUID()}`
 }
 
 export type ListPeerSessionsOptions = {
@@ -345,11 +381,12 @@ async function sendMessage(
     jwt: string,
     sessionId: string,
     message: string,
+    localId: string,
     http: AxiosInstance
 ): Promise<void> {
     const response = await http.post(
         `${apiUrl}/api/sessions/${encodeURIComponent(sessionId)}/messages`,
-        { text: message },
+        { text: message, localId },
         {
             headers: authHeaders(jwt),
             timeout: 30_000,
@@ -357,6 +394,10 @@ async function sendMessage(
         }
     )
     if (response.status >= 200 && response.status < 300 && response.data?.ok === true) {
+        // HTTP success means hub-accepted — NOT runtime delivery, and not even
+        // proof the row is still queued (the consumption ACK may race this
+        // response). Delivery is confirmed only by the recipient runtime's
+        // consumption ACK, shown in the recipient's chat queue/thread.
         return
     }
     const detail = typeof response.data?.error === 'string'
@@ -370,6 +411,7 @@ async function sendMessage(
 export async function listPeerSessions(
     options: ListPeerSessionsOptions = {}
 ): Promise<PingPeerSessionSummary[]> {
+    assertPeerToolsEnabled()
     const apiUrl = resolveApiUrl(options.apiUrl)
     const accessToken = resolveAccessToken(options.accessToken)
     const http = options.http ?? axios
@@ -456,6 +498,7 @@ export function formatPeerSessionsList(
 }
 
 export async function pingPeer(options: PingPeerOptions): Promise<PingPeerResult> {
+    assertPeerToolsEnabled()
     const prefix = normalizeSessionIdPrefix(options.sessionIdPrefix ?? '')
     const message = options.message ?? ''
     if (!prefix) {
@@ -516,18 +559,21 @@ export async function pingPeer(options: PingPeerOptions): Promise<PingPeerResult
     }
 
     onProgress?.(`sending message (${message.length} chars)...`)
-    await sendMessage(apiUrl, jwt, matched.id, message, http)
+    const localId = createPeerMessageLocalId()
+    await sendMessage(apiUrl, jwt, matched.id, message, localId, http)
 
     return {
         sessionId: matched.id,
         name,
-        resumed
+        resumed,
+        localId
     }
 }
 
 export function exitCodeForPingPeerError(error: PingPeerError): number {
     switch (error.code) {
         case 'bad_args':
+        case 'disabled':
         case 'auth_failed':
         case 'not_found':
         case 'ambiguous':
@@ -536,6 +582,7 @@ export function exitCodeForPingPeerError(error: PingPeerError): number {
             return 3
         case 'timeout':
         case 'send_failed':
+        case 'apply_failed':
             return 4
         default:
             return 1
@@ -662,6 +709,7 @@ async function fetchSessionMessages(
  * Read-only: never resumes inactive sessions (unlike `pingPeer`).
  */
 export async function inspectPeer(options: InspectPeerOptions): Promise<InspectPeerResult> {
+    assertPeerToolsEnabled()
     const prefix = normalizeSessionIdPrefix(options.sessionIdPrefix ?? '')
     if (!prefix) {
         throw new PingPeerError('bad_args', 'session id prefix is required')
@@ -718,4 +766,82 @@ export function formatInspectPeerReport(result: InspectPeerResult): string {
         }
     }
     return lines.join('\n')
+}
+
+// ── set-mode (permission mode of an existing session) ──────────────────────
+
+export type SetPeerPermissionModeOptions = {
+    sessionIdPrefix: string
+    mode: string
+    apiUrl?: string
+    accessToken?: string
+    http?: AxiosInstance
+}
+
+export type SetPeerPermissionModeResult = {
+    sessionId: string
+    name: string
+    flavor: string
+    mode: string
+    active: boolean
+}
+
+/**
+ * Same route the web permission picker uses. Active sessions apply it live;
+ * inactive ones keep it for the next resume (hub SyncEngine.applySessionConfig).
+ */
+export async function setPeerPermissionMode(options: SetPeerPermissionModeOptions): Promise<SetPeerPermissionModeResult> {
+    const prefix = normalizeSessionIdPrefix(options.sessionIdPrefix ?? '')
+    const mode = (options.mode ?? '').trim()
+    if (!prefix) {
+        throw new PingPeerError('bad_args', 'session id prefix is required')
+    }
+    if (!mode) {
+        throw new PingPeerError('bad_args', 'mode is required')
+    }
+
+    const apiUrl = resolveApiUrl(options.apiUrl)
+    const accessToken = resolveAccessToken(options.accessToken)
+    const http = options.http ?? axios
+
+    const jwt = await exchangeJwt(apiUrl, accessToken, http)
+    const sessions = await listSessions(apiUrl, jwt, http)
+    const matched = resolveSessionByPrefix(sessions, prefix)
+    const live = await getSession(apiUrl, jwt, matched.id, http)
+    // Hub treats a missing flavor as claude; mirror it so the allowed list matches.
+    const flavor = live.metadata?.flavor ?? matched.metadata?.flavor ?? 'claude'
+    const allowed: readonly string[] = getPermissionModesForFlavor(flavor)
+    if (allowed.length === 0) {
+        throw new PingPeerError('bad_args', `${flavor} sessions do not support permission modes`)
+    }
+    if (!allowed.includes(mode)) {
+        throw new PingPeerError(
+            'bad_args',
+            `invalid mode '${mode}' for ${flavor}; allowed: ${allowed.join(', ')}`
+        )
+    }
+
+    const response = await http.post(
+        `${apiUrl}/api/sessions/${encodeURIComponent(matched.id)}/permission-mode`,
+        { mode },
+        {
+            headers: authHeaders(jwt),
+            timeout: 30_000,
+            validateStatus: () => true
+        }
+    )
+    if (response.status < 200 || response.status >= 300 || response.data?.ok !== true) {
+        const detail = typeof response.data?.error === 'string'
+            ? response.data.error
+            : `HTTP ${response.status}`
+        throw new PingPeerError('apply_failed', `set-mode failed: ${detail}`)
+    }
+
+    return {
+        sessionId: matched.id,
+        name: resolvePeerSessionLabel({ ...matched, metadata: live.metadata ?? matched.metadata ?? null }),
+        flavor,
+        mode,
+        active: live.active
+    }
 }

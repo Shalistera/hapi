@@ -78,7 +78,7 @@ struct CatalogTests {
 
     @Test func codexFamilyFlavorsShareTheCodexModeSet() {
         let expected: [PermissionMode] = [.default, .readOnly, .safeYolo, .yolo]
-        #expect(permissionModes(forFlavor: "codex") == expected)
+        #expect(permissionModes(forFlavor: "codex") == [.default, .readOnly, .autoReview, .yolo])
         #expect(permissionModes(forFlavor: "gemini") == expected)
         #expect(permissionModes(forFlavor: "kimi") == expected)
         #expect(permissionModes(forFlavor: "copilot") == expected)
@@ -117,7 +117,7 @@ struct CatalogTests {
         #expect(PermissionMode.default.label == "Default")
         #expect(PermissionMode.acceptEdits.label == "Accept Edits")
         #expect(PermissionMode.bypassPermissions.label == "Yolo")
-        #expect(PermissionMode.autoReview.label == "Auto-review")
+        #expect(PermissionMode.autoReview.label == "Auto")
         #expect(PermissionMode.readOnly.label == "Read Only")
         #expect(PermissionMode.plan.label == "Plan Mode")
         #expect(PermissionMode.alwaysProceed.label == "Always Proceed")

@@ -1,7 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
     PingPeerError,
     exitCodeForPingPeerError,
+    inspectPeer,
+    listPeerSessions,
     pingPeer,
     resolveSessionByPrefix,
     type PingPeerSessionSummary
@@ -80,7 +82,9 @@ describe('pingPeer', () => {
                     return { status: 200, data: { token: 'jwt' } }
                 }
                 if (url.endsWith(`/api/sessions/${sessionId}/messages`)) {
-                    expect(body).toEqual({ text: 'hello peer' })
+                    expect(body).toMatchObject({ text: 'hello peer' })
+                    expect(typeof (body as { localId?: unknown }).localId).toBe('string')
+                    expect(String((body as { localId?: unknown }).localId)).toMatch(/^ping-peer-/)
                     return { status: 200, data: { ok: true } }
                 }
                 throw new Error(`unexpected POST ${url}`)
@@ -122,11 +126,12 @@ describe('pingPeer', () => {
             http: http as never
         })
 
-        expect(result).toEqual({
+        expect(result).toMatchObject({
             sessionId,
             name: 'Orchestrator',
             resumed: false
         })
+        expect(result.localId).toMatch(/^ping-peer-/)
         expect(http.post).toHaveBeenCalledTimes(2)
     })
 
@@ -670,5 +675,40 @@ describe('listSessions query params', () => {
         })
         expect(result.sessionId).toBe(sessionId)
         expect(pingParams[0]).toBeUndefined()
+    })
+})
+
+
+describe('HAPI_DISABLE_PEER_TOOLS kill switch', () => {
+    const original = process.env.HAPI_DISABLE_PEER_TOOLS
+
+    beforeEach(() => {
+        process.env.HAPI_DISABLE_PEER_TOOLS = '1'
+    })
+
+    afterEach(() => {
+        if (original === undefined) {
+            delete process.env.HAPI_DISABLE_PEER_TOOLS
+        } else {
+            process.env.HAPI_DISABLE_PEER_TOOLS = original
+        }
+    })
+
+    it('pingPeer refuses before any network call', async () => {
+        await expect(pingPeer({ sessionIdPrefix: 'abc', message: 'hi' }))
+            .rejects.toMatchObject({ code: 'disabled' })
+    })
+
+    it('inspectPeer refuses before any network call', async () => {
+        await expect(inspectPeer({ sessionIdPrefix: 'abc' }))
+            .rejects.toMatchObject({ code: 'disabled' })
+    })
+
+    it('listPeerSessions refuses before any network call', async () => {
+        await expect(listPeerSessions()).rejects.toMatchObject({ code: 'disabled' })
+    })
+
+    it('maps the disabled code to the usage exit code', () => {
+        expect(exitCodeForPingPeerError(new PingPeerError('disabled', 'disabled on this machine'))).toBe(2)
     })
 })

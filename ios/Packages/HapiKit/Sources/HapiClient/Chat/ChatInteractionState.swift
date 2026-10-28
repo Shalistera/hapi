@@ -300,9 +300,7 @@ public func buildSessionConfigState(
         active: active,
         controlledByUser: controlledByUser,
         permissionMode: detail?.permissionMode,
-        permissionModes: permissionModeOptions(forFlavor: flavor).filter {
-            detail?.metadata?.capabilities?.concurrentClients != true || $0.mode.rawValue != "safe-yolo"
-        },
+        permissionModes: permissionModeOptions(forFlavor: flavor),
         collaborationMode: detail?.collaborationMode,
         canChangeCollaborationMode: detail != nil && flavor == "codex" && active && !controlledByUser,
         model: model,

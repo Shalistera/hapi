@@ -38,6 +38,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.hapi.companion.R
+import app.hapi.companion.feature.sessions.SessionDateRangePickerDialog
 import app.hapi.companion.feature.sessions.SessionFilterSheet
 import app.hapi.companion.feature.sessions.SessionListScreen
 import app.hapi.companion.feature.sessions.SessionListViewModel
@@ -59,6 +60,7 @@ fun HomeScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     var showFilters by rememberSaveable(activeHubUrl) { mutableStateOf(false) }
+    var showDateFilter by rememberSaveable(activeHubUrl) { mutableStateOf(false) }
     var showSignOutConfirm by rememberSaveable(activeHubUrl) { mutableStateOf(false) }
 
     Scaffold(
@@ -68,7 +70,9 @@ fun HomeScreen(
                 pairedHubs = pairedHubs,
                 hasMachineFilters = state.hasMachineFilters,
                 hasActiveFilter = state.activeMachineFilter != null,
+                hasActiveDateRange = state.dateRange != null,
                 onOpenFilters = { showFilters = true },
+                onOpenDateFilter = { showDateFilter = true },
                 onSwitchHub = onSwitchHub,
                 onPairAnotherHub = onPairAnotherHub,
                 onOpenSettings = onOpenSettings,
@@ -86,6 +90,18 @@ fun HomeScreen(
 
     if (showFilters) {
         SessionFilterSheet(state, select = { viewModel.setMachineFilter(it); showFilters = false }, dismiss = { showFilters = false })
+    }
+    if (showDateFilter) {
+        SessionDateRangePickerDialog(
+            current = state.dateRange,
+            activityEpochDays = state.dateActivityEpochDays,
+            onApply = { startEpochDay, endEpochDay ->
+                viewModel.setDateRange(startEpochDay, endEpochDay)
+                showDateFilter = false
+            },
+            onClear = { viewModel.clearDateRange() },
+            onDismiss = { showDateFilter = false },
+        )
     }
     if (showSignOutConfirm) {
         AlertDialog(
@@ -118,6 +134,9 @@ internal fun HomeTopBar(
     pairedHubs: List<String>,
     hasMachineFilters: Boolean,
     hasActiveFilter: Boolean,
+    hasActiveDateRange: Boolean = false,
+    /** Opens the activity date-range picker; null hides the calendar action. */
+    onOpenDateFilter: (() -> Unit)? = null,
     onOpenFilters: () -> Unit,
     onSwitchHub: (String) -> Unit,
     onPairAnotherHub: () -> Unit,
@@ -174,6 +193,15 @@ internal fun HomeTopBar(
             }
         },
         actions = {
+            // Always reachable: the date lens applies even with a single machine.
+            if (onOpenDateFilter != null) {
+                IconButton(onClick = onOpenDateFilter, modifier = Modifier.size(48.dp)) {
+                    // Dot badge while a range is active mirrors the web calendar icon.
+                    BadgedBox(badge = { if (hasActiveDateRange) Badge() }) {
+                        Icon(painterResource(R.drawable.ic_calendar), contentDescription = stringResource(R.string.sessions_time_filter_label))
+                    }
+                }
+            }
             if (hasMachineFilters) {
                 val filterState = stringResource(if (hasActiveFilter) R.string.sessions_filters_active else R.string.sessions_filter_all)
                 IconButton(onClick = onOpenFilters, modifier = Modifier.size(48.dp).semantics { stateDescription = filterState }) {

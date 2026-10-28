@@ -151,6 +151,20 @@ export class SDKToLogConverter {
     }
 
     /**
+     * The contextWindow currently resolved for this session's model — the
+     * same value `convert()` stamps onto relayed assistant usage. Undefined
+     * until a system/init or result message establishes it. The
+     * post-compaction usage refresh (claudeRemoteLauncher) uses this so its
+     * context-only sample doesn't erase the status bar's known window
+     * denominator (the reducer replaces latestUsage wholesale).
+     */
+    currentContextWindow(): number | undefined {
+        return this.resolvedContextWindowKey
+            ? this.modelContextWindows.get(this.resolvedContextWindowKey)
+            : undefined
+    }
+
+    /**
      * Update session ID (for when session changes during resume)
      */
     updateSessionId(sessionId: string): void {
@@ -283,6 +297,7 @@ export class SDKToLogConverter {
                     logMessage.isMeta = true
                 }
 
+
                 // Check if this is a tool result and add mode if available
                 if (Array.isArray(userMsg.message.content)) {
                     for (const content of userMsg.message.content) {
@@ -327,7 +342,9 @@ export class SDKToLogConverter {
                     type: 'assistant',
                     message: assistantMsg.message,
                     // Assistant messages often have additional fields
-                    requestId: (assistantMsg as any).requestId
+                    requestId: (assistantMsg as any).requestId,
+                    // Set on synthetic API error messages; the web renders these as errors
+                    error: (assistantMsg as any).error
                 }
                 // if (assistantMsg.message.content && Array.isArray(assistantMsg.message.content)) {
                 //     for (const content of assistantMsg.message.content) {

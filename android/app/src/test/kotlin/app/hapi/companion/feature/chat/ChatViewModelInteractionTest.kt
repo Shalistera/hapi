@@ -15,6 +15,8 @@ import app.hapi.data.store.MachineListStore
 import app.hapi.data.store.MessageWindowStores
 import app.hapi.data.store.ScratchlistAttachmentDeleteResult
 import app.hapi.data.store.ScratchlistCreateResult
+import app.hapi.data.store.ScratchlistEntryOps
+import app.hapi.data.store.ScratchlistMoveDirection
 import app.hapi.data.store.ScratchlistSessionState
 import app.hapi.data.store.ScratchlistUploadResult
 import app.hapi.data.store.SessionDetailStore
@@ -391,6 +393,11 @@ private class FakeScratchlist : SessionScratchlist {
         attachments: List<app.hapi.protocol.wire.ScratchlistAttachment>?,
     ): Boolean = true
     override suspend fun deleteEntry(sessionId: String, entryId: String): Boolean = true
+    override fun moveEntry(sessionId: String, entryId: String, direction: ScratchlistMoveDirection) {
+        sessionState.value = sessionState.value.copy(
+            entries = ScratchlistEntryOps.moveEntry(sessionState.value.entries, entryId, direction)
+        )
+    }
     override suspend fun uploadAttachment(
         sessionId: String,
         filename: String,
@@ -1057,6 +1064,67 @@ class ChatViewModelInteractionTest {
         assertEquals("default", harness.sessionStore.currentDetail(IX_SESSION)?.permissionMode)
         assertTrue(harness.sessionStore.calls.value.count { it == "loadDetail:$IX_SESSION" } >= 2)
         assertEquals(listOf("mode:acceptEdits"), harness.api.configCalls.value)
+    }
+
+    @Test
+    fun `permission mode switch is withheld for terminal-controlled copilot sessions`() = runTest {
+        val harness = InteractionHarness(
+            this,
+            detail(
+                flavor = "copilot",
+                permissionMode = "read-only",
+                agentState = AgentState(controlledByUser = true),
+            ),
+        )
+        harness.viewModel.start()
+        harness.sessionStore.calls.first { "loadDetail:$IX_SESSION" in it }
+
+        harness.viewModel.setPermissionMode(PermissionMode.Yolo)
+        testScheduler.advanceUntilIdle()
+
+        // Web parity: the switcher callback is withheld (SessionChat.tsx:
+        // 2159-2163) — no request, no optimistic flip.
+        assertTrue(harness.api.configCalls.value.none { it.startsWith("mode:") })
+        assertEquals("read-only", harness.sessionStore.currentDetail(IX_SESSION)?.permissionMode)
+    }
+
+    @Test
+    fun `permission mode switch survives terminal control outside copilot and shared-clients copilot`() = runTest {
+        val sharedClients = detail(
+            flavor = "copilot",
+            permissionMode = "read-only",
+            agentState = AgentState(controlledByUser = true),
+        ).copy(
+            metadata = SessionMetadata(
+                path = "/repo", host = "devbox", flavor = "copilot",
+                capabilities = SessionCapabilities(concurrentClients = true),
+            ),
+        )
+        val harness = InteractionHarness(this, sharedClients)
+        harness.viewModel.start()
+        harness.sessionStore.calls.first { "loadDetail:$IX_SESSION" in it }
+
+        harness.viewModel.setPermissionMode(PermissionMode.Yolo)
+        harness.api.configCalls.first { "mode:yolo" in it }
+        testScheduler.advanceUntilIdle()
+
+        // Terminal-controlled claude keeps the switcher: only copilot loses
+        // it on web (controlledByUser derivation matches SessionChat.tsx:996).
+        harness.sessionStore.setDetail(
+            detail(flavor = "claude", agentState = AgentState(controlledByUser = true)),
+        )
+        harness.viewModel.setPermissionMode(PermissionMode.AcceptEdits)
+        harness.api.configCalls.first { "mode:acceptEdits" in it }
+    }
+
+    @Test
+    fun `permission mode switch stays available for inactive sessions`() = runTest {
+        val harness = InteractionHarness(this, detail(active = false, permissionMode = "default"))
+        harness.viewModel.start()
+        harness.sessionStore.calls.first { "loadDetail:$IX_SESSION" in it }
+
+        harness.viewModel.setPermissionMode(PermissionMode.AcceptEdits)
+        harness.api.configCalls.first { "mode:acceptEdits" in it }
     }
 
     @Test

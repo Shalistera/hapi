@@ -1,11 +1,10 @@
 import { SESSION_LIFECYCLE_IDLE, SESSION_LIFECYCLE_RUNNING } from '@hapi/protocol'
 import { AgentStateSchema, MetadataSchema, SessionPatchSchema, TeamStateSchema } from '@hapi/protocol/schemas'
-import type { CodexCollaborationMode, CopilotAgentMode, PermissionMode, Session, SessionPatch } from '@hapi/protocol/types'
+import type { BackgroundTask, CodexCollaborationMode, CopilotAgentMode, PermissionMode, Session, SessionPatch } from '@hapi/protocol/types'
 import type { Store } from '../store'
 import { clampAliveTime } from './aliveTime'
 import { EventPublisher } from './eventPublisher'
 import { extractTodoWriteTodosFromMessageContent, TodosSchema } from './todos'
-import { extractBackgroundTaskDelta } from './backgroundTasks'
 import { resolveSessionIdleTimeoutMs, shouldClearKeepaliveIdle, shouldMarkKeepaliveIdle } from './sessionIdle'
 
 const QUEUED_MESSAGE_THINKING_GRACE_MS = 15_000
@@ -35,7 +34,14 @@ export class SessionCache {
 
     constructor(
         private readonly store: Store,
-        private readonly publisher: EventPublisher
+        private readonly publisher: EventPublisher,
+        private readonly hooks: {
+            /** Fires after a merge deletes a session row. Dedup collisions and
+             *  resume-id rotation both land in `mergeSessionData`, so this is
+             *  the single notification point; owners keyed on the removed id
+             *  (e.g. the hub's enumeration cache) release their entries here. */
+            onSessionMergedAway?: (oldSessionId: string, newSessionId: string) => void
+        } = {}
     ) {
     }
 
@@ -234,6 +240,7 @@ export class SessionCache {
             thinkingAt: existing?.thinkingAt ?? 0,
             activeTurnStartedAt: existing?.activeTurnStartedAt ?? null,
             backgroundTaskCount: existing?.backgroundTaskCount ?? 0,
+            backgroundTasks: existing?.backgroundTasks ?? [],
             todos,
             teamState,
             todosUpdatedAt: stored.todosUpdatedAt ?? 0,
@@ -364,6 +371,7 @@ export class SessionCache {
         if (patch.permissionMode !== undefined) session.permissionMode = patch.permissionMode
         if (patch.collaborationMode !== undefined) session.collaborationMode = patch.collaborationMode
         if (patch.backgroundTaskCount !== undefined) session.backgroundTaskCount = patch.backgroundTaskCount
+        if (patch.backgroundTasks !== undefined) session.backgroundTasks = patch.backgroundTasks
         if (patch.todos !== undefined) {
             session.todos = patch.todos.value
             session.todosUpdatedAt = patch.todos.version
@@ -422,7 +430,7 @@ export class SessionCache {
             && this.store.messages.getImmediateQueuedLocalMessages(session.id).length > 0
 
         session.active = true
-        session.activeAt = Math.max(session.activeAt, t)
+        session.activeAt = Math.max(session.activeAt, hubNow)
         session.thinking = requestedThinking || preserveQueuedThinking
         session.thinkingAt = t
         if (!requestedThinking && preserveQueuedThinking && hasUnconsumedPrompt) {
@@ -565,20 +573,21 @@ export class SessionCache {
         }
     }
 
-    applyBackgroundTaskDelta(sessionId: string, delta: { started: number; completed: number }): void {
+    setBackgroundTasks(sessionId: string, tasks: BackgroundTask[]): void {
         const session = this.sessions.get(sessionId)
         if (!session) return
+        const current = session.backgroundTasks ?? []
+        if (tasks.length === current.length && tasks.every((task, index) =>
+            task.id === current[index]?.id && task.description === current[index]?.description
+        )) return
 
-        const prev = session.backgroundTaskCount ?? 0
-        const next = Math.max(0, prev + delta.started - delta.completed)
-        if (next === prev) return
-
-        session.backgroundTaskCount = next
+        session.backgroundTasks = tasks
+        session.backgroundTaskCount = tasks.length
         this.recordAgentProgress(sessionId)
         this.publisher.emit({
             type: 'session-updated',
             sessionId,
-            data: { backgroundTaskCount: next } satisfies SessionPatch
+            data: { backgroundTaskCount: tasks.length, backgroundTasks: tasks } satisfies SessionPatch
         })
     }
 
@@ -768,22 +777,30 @@ export class SessionCache {
         session.thinkingAt = t
         session.activeTurnStartedAt = null
         session.backgroundTaskCount = 0
+        session.backgroundTasks = []
         this.pendingThinkingUntilBySessionId.delete(session.id)
 
         this.publisher.emit({
             type: 'session-updated',
             sessionId: session.id,
-            data: { active: false, thinking: false, activeTurnStartedAt: null, backgroundTaskCount: 0 } satisfies SessionPatch
+            data: { active: false, thinking: false, activeTurnStartedAt: null, backgroundTaskCount: 0, backgroundTasks: [] } satisfies SessionPatch
         })
     }
 
     expireInactive(now: number = Date.now()): string[] {
         const sessionTimeoutMs = 30_000
+        // Thinking sessions get a longer offline grace: turns routinely outlive brief
+        // transport blackouts on the runner host (outbound messages are buffered and
+        // flushed on reconnect), so expiring them on the plain keepalive timeout flips
+        // sessions offline mid-turn only for them to come back the moment the socket
+        // reconnects. Bounded so a genuinely dead process still expires.
+        const thinkingSessionTimeoutMs = 300_000
         const expired: string[] = []
 
         for (const session of this.sessions.values()) {
             if (!session.active) continue
-            if (now - session.activeAt <= sessionTimeoutMs) continue
+            const timeoutMs = session.thinking ? thinkingSessionTimeoutMs : sessionTimeoutMs
+            if (now - session.activeAt <= timeoutMs) continue
             session.active = false
             this.store.sessions.setSessionActive(session.id, false, now, session.namespace)
             session.thinking = false
@@ -977,7 +994,7 @@ export class SessionCache {
         throw new Error('Session was modified concurrently while archiving from hub')
     }
 
-    async renameSession(sessionId: string, name: string): Promise<void> {
+    async renameSession(sessionId: string, name: string | undefined, titleLocked?: boolean): Promise<void> {
         // tiann/hapi#919: retry-with-refresh on version-mismatch instead of
         // throwing on the first contention. Mirrors the good pattern in
         // mergeSessions (~L780) and in syncEngine's metadata helpers. Without
@@ -990,14 +1007,14 @@ export class SessionCache {
             }
 
             const currentMetadata = session.metadata ?? { path: '', host: '' }
-            const newMetadata = { ...currentMetadata, name }
+            const newMetadata = name === undefined ? { ...currentMetadata } : { ...currentMetadata, name }
 
             const result = this.store.sessions.updateSessionMetadata(
                 sessionId,
                 newMetadata,
                 session.metadataVersion,
                 session.namespace,
-                { touchUpdatedAt: false }
+                { touchUpdatedAt: false, allowTitleUpdate: true, titleLocked }
             )
 
             if (result.result === 'error') {
@@ -1015,7 +1032,7 @@ export class SessionCache {
         throw new Error('Session was modified concurrently. Please try again.')
     }
 
-    async updateSessionSummary(sessionId: string, text: string): Promise<void> {
+    async updateSessionSummary(sessionId: string, text: string, titleLocked?: boolean): Promise<void> {
         // Keep the generated/native title separate from metadata.name. A
         // manually chosen name must continue to win in the Web title helper,
         // while the summary remains available as the agent-authored fallback.
@@ -1039,7 +1056,7 @@ export class SessionCache {
                 newMetadata,
                 session.metadataVersion,
                 session.namespace,
-                { touchUpdatedAt: false }
+                { touchUpdatedAt: false, allowTitleUpdate: true, titleLocked }
             )
 
             if (result.result === 'error') {
@@ -1055,6 +1072,101 @@ export class SessionCache {
         }
 
         throw new Error('Session was modified concurrently. Please try again.')
+    }
+
+    /** Preserve the observed turn identity across a Hub restart. */
+    updateAutomaticTitleTurn(sessionId: string, turn: { first: boolean; completed: boolean }): boolean {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session) return false
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...(session.metadata ?? { path: '', host: '' }), titleSuggestionTurn: turn },
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'error') return false
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return true
+            }
+            this.refreshSession(sessionId)
+        }
+        return false
+    }
+
+    /**
+     * Atomically reserve the one automatic first-turn title attempt.
+     * The Hub-owned marker survives sparse CLI updates and provider failure.
+     */
+    claimAutomaticTitleAttempt(sessionId: string, attemptedAt: number = Date.now()): boolean {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session) return false
+
+            const metadata = session.metadata
+            if (metadata?.name?.trim() || metadata?.summary?.text?.trim() || metadata?.titleSuggestionAutoAttemptedAt !== undefined) {
+                return false
+            }
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...(metadata ?? { path: '', host: '' }), titleSuggestionAutoAttemptedAt: attemptedAt },
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+
+            if (result.result === 'error') return false
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return true
+            }
+
+            this.refreshSession(sessionId)
+        }
+
+        return false
+    }
+
+    /**
+     * Persist an automatic title only while the session is still untitled.
+     * A manual/native title that arrives while the provider is in flight wins.
+     */
+    async updateAutomaticSessionSummary(sessionId: string, text: string): Promise<boolean> {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session) return false
+
+            const metadata = session.metadata
+            if (metadata?.name?.trim() || metadata?.summary?.text?.trim()) {
+                return false
+            }
+
+            const nextMetadata = { ...(metadata ?? { path: '', host: '' }) }
+            if (typeof nextMetadata.name === 'string' && !nextMetadata.name.trim()) {
+                delete nextMetadata.name
+            }
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...nextMetadata, summary: { text, updatedAt: Date.now() } },
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+
+            if (result.result === 'error') return false
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return true
+            }
+
+            this.refreshSession(sessionId)
+        }
+
+        return false
     }
 
     /**
@@ -1272,6 +1384,25 @@ export class SessionCache {
             throw new Error('Session not found for merge')
         }
 
+        // A resume/dedup may replace the row. Transfer title ownership before
+        // moving data, preserving fresh source/destination metadata on retries.
+        let metadataTransferred = false
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const source = this.store.sessions.getSessionByNamespace(oldSessionId, namespace)
+            const latest = this.store.sessions.getSessionByNamespace(newSessionId, namespace)
+            if (!source || !latest) break
+            const result = this.store.sessions.updateSessionMetadata(
+                newSessionId,
+                this.mergeSessionMetadata(source.metadata, latest.metadata),
+                latest.metadataVersion,
+                namespace,
+                { touchUpdatedAt: false, inheritTitleLockFrom: options.deleteOldSession ? oldSessionId : undefined }
+            )
+            if (result.result === 'success') { metadataTransferred = true; break }
+            if (result.result === 'error') break
+        }
+        if (!metadataTransferred) throw new Error('Failed to preserve session metadata during merge')
+
         const movedMessages = this.store.messages.mergeSessionMessages(oldSessionId, newSessionId)
         // mergeSessions deletes the source. mergeSessionHistory keeps it alive
         // with the original socket, so its notify chain must stay on that id.
@@ -1335,27 +1466,6 @@ export class SessionCache {
             // clients viewing the old id drop stale cache entries that
             // would 404 on edit/delete.
             this.emitScratchlistChanged(oldSessionId)
-        }
-
-        const mergedMetadata = this.mergeSessionMetadata(oldStored.metadata, newStored.metadata)
-        if (mergedMetadata !== null && mergedMetadata !== newStored.metadata) {
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-                const latest = this.store.sessions.getSessionByNamespace(newSessionId, namespace)
-                if (!latest) break
-                const result = this.store.sessions.updateSessionMetadata(
-                    newSessionId,
-                    mergedMetadata,
-                    latest.metadataVersion,
-                    namespace,
-                    { touchUpdatedAt: false }
-                )
-                if (result.result === 'success') {
-                    break
-                }
-                if (result.result === 'error') {
-                    break
-                }
-            }
         }
 
         if (newStored.model === null && oldStored.model !== null) {
@@ -1482,6 +1592,7 @@ export class SessionCache {
                 this.recordAgentProgress(newSessionId, oldProgressAt)
             }
             this.agentProgressAtBySessionId.delete(oldSessionId)
+            this.hooks.onSessionMergedAway?.(oldSessionId, newSessionId)
         } else {
             this.refreshSession(oldSessionId)
         }
@@ -1507,6 +1618,17 @@ export class SessionCache {
 
         if (typeof oldObj.name === 'string' && typeof newObj.name !== 'string') {
             merged.name = oldObj.name
+            changed = true
+        }
+
+        if (typeof oldObj.titleSuggestionAutoAttemptedAt === 'number'
+            && typeof newObj.titleSuggestionAutoAttemptedAt !== 'number') {
+            merged.titleSuggestionAutoAttemptedAt = oldObj.titleSuggestionAutoAttemptedAt
+            changed = true
+        }
+
+        if (oldObj.titleSuggestionTurn && !newObj.titleSuggestionTurn) {
+            merged.titleSuggestionTurn = oldObj.titleSuggestionTurn
             changed = true
         }
 
@@ -1654,12 +1776,15 @@ export class SessionCache {
     private extractAgentSessionId(
         metadata: NonNullable<Session['metadata']>
     ): { field: 'codexSessionId' | 'claudeSessionId' | 'geminiSessionId' | 'opencodeSessionId' | 'grokSessionId' | 'cursorSessionId' | 'piSessionId' | 'agySessionId' | 'copilotSessionId'; value: string; dedupeKey: string; machineId?: string } | null {
-        const scoped = (field: 'codexSessionId' | 'claudeSessionId' | 'geminiSessionId' | 'opencodeSessionId' | 'grokSessionId' | 'cursorSessionId' | 'piSessionId' | 'agySessionId' | 'copilotSessionId', value: string) => ({
-            field,
-            value,
-            dedupeKey: field === 'piSessionId' ? `${field}:${metadata.machineId ?? 'unscoped'}:${value}` : `${field}:${value}`,
-            ...(field === 'piSessionId' && metadata.machineId ? { machineId: metadata.machineId } : {})
-        })
+        const scoped = (field: 'codexSessionId' | 'claudeSessionId' | 'geminiSessionId' | 'opencodeSessionId' | 'grokSessionId' | 'cursorSessionId' | 'piSessionId' | 'agySessionId' | 'copilotSessionId', value: string) => {
+            const machineScoped = field === 'piSessionId' || field === 'opencodeSessionId'
+            return {
+                field,
+                value,
+                dedupeKey: machineScoped ? `${field}:${metadata.machineId ?? 'unscoped'}:${value}` : `${field}:${value}`,
+                ...(machineScoped && metadata.machineId ? { machineId: metadata.machineId } : {})
+            }
+        }
         if (metadata.codexSessionId) return scoped('codexSessionId', metadata.codexSessionId)
         if (metadata.claudeSessionId) return scoped('claudeSessionId', metadata.claudeSessionId)
         if (metadata.geminiSessionId) return scoped('geminiSessionId', metadata.geminiSessionId)
@@ -1696,8 +1821,9 @@ export class SessionCache {
 
                 const currentSession = this.sessions.get(sessionId)
                 const candidates: { id: string; session: Session }[] = []
+                const machineScoped = agentId.field === 'piSessionId' || agentId.field === 'opencodeSessionId'
                 if (currentSession?.metadata && currentSession.metadata[agentId.field] === agentId.value) {
-                    if (agentId.field !== 'piSessionId' || currentSession.metadata.machineId === agentId.machineId) {
+                    if (!machineScoped || currentSession.metadata.machineId === agentId.machineId) {
                         candidates.push({ id: sessionId, session: currentSession })
                     }
                 }
@@ -1706,7 +1832,7 @@ export class SessionCache {
                     if (existing.namespace !== session.namespace) continue
                     if (!existing.metadata) continue
                     if (existing.metadata[agentId.field] !== agentId.value) continue
-                    if (agentId.field === 'piSessionId' && existing.metadata.machineId !== agentId.machineId) continue
+                    if (machineScoped && existing.metadata.machineId !== agentId.machineId) continue
                     candidates.push({ id: existingId, session: existing })
                 }
 

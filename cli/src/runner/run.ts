@@ -15,8 +15,9 @@ import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import { writeRunnerState, RunnerLocallyPersistedState, readRunnerState, acquireRunnerLock, releaseRunnerLock } from '@/persistence';
 import { getCliArgs } from '@/utils/cliArgs';
 import { getProcessStartMarker, isProcessAlive, isWindows, killProcess, killProcessByChildProcess, killProcessTreeByPid } from '@/utils/process';
-import { findStopSessionOrphanTargets, reapRunnerSpawnedOrphans } from '@/runner/orphanReap';
+import { findStopSessionOrphanTargets, listWindowsProcessesWithCommandLine, reapRunnerSpawnedOrphans } from '@/runner/orphanReap';
 import { decideUntrackedRunnerWebhook } from '@/runner/lateRunnerWebhook';
+import { cleanupFailedStartupAfterExit, sessionStartupTimeout, waitForRecoverableStartup } from './sessionStartup';
 import {
     decideKeepWrapperArchive,
     decideRawPidStop,
@@ -66,7 +67,7 @@ export function createSpawnDeduplicator(
   const childState = new Map<string, 'alive' | 'stopping'>();
 
   const dedupe = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
-    const key = options.existingSessionId;
+    const key = options.existingSessionId ?? options.reservedSessionId;
     if (!key) {
       return await spawnOnce(options);
     }
@@ -399,18 +400,6 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
     }
     persistResumeProcesses();
 
-    // Webhook timeout tolerance. Opus 1M + --resume can legitimately take
-    // longer than the default 15s to reach the "Session started" webhook
-    // (observed real-world durations of 30s – 60min under rate-limit /
-    // heavy session restore). Allow advanced users to raise this ceiling
-    // so that slow starts no longer leave orphaned child processes which
-    // later report back as ghost sessions.
-    const envWebhookTimeout = Number(process.env.HAPI_RUNNER_WEBHOOK_TIMEOUT_MS);
-    const webhookTimeoutMs =
-      Number.isFinite(envWebhookTimeout) && envWebhookTimeout > 0
-        ? envWebhookTimeout
-        : 15_000;
-
     // Session spawning awaiter system
     const pidToAwaiter = new Map<number, (session: TrackedSession) => void>();
     const pidToErrorAwaiter = new Map<number, (errorMessage: string) => void>();
@@ -461,6 +450,8 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
         existingSession.sharedSessions[sessionId] = sessionMetadata;
         invalidateVerifiedExit(sessionId);
         // Native /new or /fork cannot replace the primary spawn confirmation.
+        if (pidToAwaiter.has(pid) && existingSession.requestedHappySessionId
+          && existingSession.requestedHappySessionId !== sessionId) return;
         if (existingSession.happySessionId && existingSession.happySessionId !== sessionId) return;
       }
 
@@ -519,11 +510,26 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           // post-restart CLIs must be adopted so StopSession can find them —
           // Claude often has no HAPI id on argv yet (#1910 / #1911).
           const timedOutByThisRunner = webhookTimeoutOrphanPids.has(pid);
-          webhookTimeoutOrphanPids.delete(pid);
+          // Adoption persists this marker as the generation a later stopSession
+          // may tree-kill, so the webhook must prove it still owns the PID
+          // (metadata.hostStartMarker). A late webhook after PID reuse would
+          // otherwise pin a foreign process to the session.
+          const processStartMarker = getProcessStartMarker(pid);
           const decision = decideUntrackedRunnerWebhook({
             concurrentClients: Boolean(sessionMetadata.capabilities?.concurrentClients),
             timedOutByThisRunner,
+            reportedStartMarker: sessionMetadata.hostStartMarker,
+            currentStartMarker: processStartMarker,
           });
+          if (decision === 'ignore') {
+            // Keep the timeout stamp: a transient probe failure must not turn
+            // the ghost's next webhook into an adoption.
+            logger.debug(
+              `[RUNNER RUN] Untracked runner-spawned PID ${pid} (session ${sessionId}) did not prove its process generation (reported ${sessionMetadata.hostStartMarker ?? 'none'}, live ${processStartMarker ?? 'none'}); leaving it alone`
+            );
+            return;
+          }
+          webhookTimeoutOrphanPids.delete(pid);
           if (decision === 'kill') {
             logger.debug(
               `[RUNNER RUN] Ignoring late webhook from orphaned runner-spawned PID ${pid} (session ${sessionId}). Terminating child.`
@@ -539,7 +545,6 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
             return;
           }
 
-          const processStartMarker = getProcessStartMarker(pid);
           const adopted: TrackedSession = {
             ...(sessionMetadata.capabilities?.concurrentClients
               ? { sharedSessions: { [sessionId]: sessionMetadata } }
@@ -869,6 +874,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
         }
         invalidateVerifiedExit(`PID-${pid}`);
         logger.debug(`[RUNNER RUN] Spawned process with PID ${pid}`);
+        const webhookTimeoutMs = sessionStartupTimeout(options.agent, process.env.HAPI_RUNNER_WEBHOOK_TIMEOUT_MS);
         let observedExitCode: number | null = null;
         let observedExitSignal: NodeJS.Signals | null = null;
         const buildWebhookFailureMessage = (reason: 'timeout' | 'exit-before-webhook' | 'process-error-before-webhook'): string => {
@@ -878,7 +884,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           } else if (reason === 'process-error-before-webhook') {
             message = `Session process error before webhook for PID ${pid}`;
           } else {
-            message = `Session webhook timeout for PID ${pid}`;
+            message = `Session webhook timeout for PID ${pid} after ${webhookTimeoutMs}ms`;
           }
 
           if (observedExitCode !== null || observedExitSignal) {
@@ -887,6 +893,10 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
             } else {
               message += ` (signal ${observedExitSignal})`;
             }
+          }
+
+          if (reason === 'timeout') {
+            message += '. Adjust HAPI_RUNNER_WEBHOOK_TIMEOUT_MS on the runner host and restart the runner to change this wait';
           }
 
           const trimmedTail = stderrTail.trim();
@@ -954,7 +964,37 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
         // Wait for webhook to populate session with happySessionId
         logger.debug(`[RUNNER RUN] Waiting for session webhook for PID ${pid}`);
 
-        const spawnResult = await new Promise<SpawnSessionResult>((resolve) => {
+        const recoverableStartup = options.agent === 'codex' ? waitForRecoverableStartup<TrackedSession>({
+          timeoutMs: webhookTimeoutMs,
+          timeoutMessage: `Codex startup is still unconfirmed for PID ${pid}; the process remains tracked. Wait for the existing session instead of creating another, or stop it explicitly.`,
+          sessionId: session => session.happySessionId!,
+          onLateReady: session => {
+            if (trackHubId) spawnSession.recoverChild(trackHubId, { type: 'success', sessionId: session.happySessionId! });
+            reportSpawnOutcomeToHub?.({ type: 'success' });
+            logger.debug(`[RUNNER RUN] Late startup confirmed for PID ${pid}`);
+          },
+          onLateFailure: message => {
+            reportSpawnOutcomeToHub?.({ type: 'error', details: { message, pid } });
+            if (worktreeInfo && happyProcess) cleanupFailedStartupAfterExit(
+              happyProcess,
+              () => !trackedSession.happySessionId,
+              () => { void cleanupWorktree().catch(error => logger.debug('[RUNNER RUN] Late startup worktree cleanup failed', error)); },
+            );
+          },
+        }) : null;
+        if (recoverableStartup) {
+          // Keep both callbacks and all PID bindings after the caller deadline.
+          // A shared wrapper can already own roots; expiry is not exit evidence.
+          pidToAwaiter.set(pid, session => {
+            pidToAwaiter.delete(pid); pidToErrorAwaiter.delete(pid);
+            recoverableStartup.confirm(session);
+          });
+          pidToErrorAwaiter.set(pid, message => {
+            pidToAwaiter.delete(pid); pidToErrorAwaiter.delete(pid);
+            recoverableStartup.fail(message);
+          });
+        }
+        const spawnResult = recoverableStartup ? await recoverableStartup.result : await new Promise<SpawnSessionResult>((resolve) => {
           // Set timeout for webhook. Default is 15s but can be raised via
           // HAPI_RUNNER_WEBHOOK_TIMEOUT_MS for users on slow models
           // (e.g. opus[1m] --resume).
@@ -1123,11 +1163,29 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
 
       const readLiveRuntimesForStop = async () => {
         try {
-          return (await readRuntimes({ strict: true })).filter(runtime =>
+          const scanStarted = Date.now();
+          const records = (await readRuntimes({ strict: true })).filter(runtime =>
             runtime.hub === configuration.apiUrl
             && runtime.authHash === runtimeAuthHash()
-            && runtimeMayBeAlive(runtime)
           );
+          // A fresh, complete process snapshot keeps archive cost independent
+          // of old registry entries. Per-record tasklist/CIM calls made three
+          // reads of nine retired runtimes exceed the 30s StopSession RPC.
+          // Read the registry first, then snapshot; never reuse it across scans.
+          let markers: ReadonlyMap<number, string | null> | undefined;
+          if (isWindows() && records.length > 0) {
+            try {
+              const processes = listWindowsProcessesWithCommandLine();
+              if (!processes.length) throw new Error('Empty Windows process snapshot');
+              markers = new Map(processes.map(proc => [proc.pid, proc.startMarker ?? null]));
+            } catch (error) {
+              logger.warn(`[RUNNER RUN] Cannot verify Windows runtimes during stop of ${sessionId}: ${String(error)}`);
+              return null;
+            }
+          }
+          const live = records.filter(runtime => runtimeMayBeAlive(runtime, markers));
+          logger.debug('[RUNNER RUN] Runtime stop scan', { sessionId, records: records.length, live: live.length, elapsedMs: Date.now() - scanStarted });
+          return live;
         } catch (error) {
           logger.warn(
             `[RUNNER RUN] Codex runtime registry unreadable during stop of ${sessionId}: ${
@@ -1319,6 +1377,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
             return await finishKeepWrapperDetach(pid);
           }
 
+          let treeTerminationVerified = false;
           if (session.startedBy === 'runner') {
             // Adopted post-restart sessions have no ChildProcess handle — still
             // tree-kill so agent grandchildren cannot outlive the wrapper.
@@ -1349,14 +1408,18 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
               }
             }
             try {
+              const reportStop: Parameters<typeof killProcessTreeByPid>[2] = report => {
+                logger.debug('[RUNNER RUN] Session process tree stop proof', { sessionId, ...report });
+              };
               const treeStopped = session.childProcess
-                ? await killProcessByChildProcess(session.childProcess)
-                : await killProcessTreeByPid(pid);
+                ? await killProcessByChildProcess(session.childProcess, false, reportStop)
+                : await killProcessTreeByPid(pid, false, reportStop);
               if (!treeStopped) {
                 logger.debug(`[RUNNER RUN] Process tree for session ${sessionId} is still alive after stop request`);
                 return 'still_alive';
               }
               logger.debug(`[RUNNER RUN] Requested termination for runner-spawned session ${sessionId}`);
+              treeTerminationVerified = true;
             } catch (error) {
               logger.debug(`[RUNNER RUN] Failed to kill session ${sessionId}:`, error);
               return 'still_alive';
@@ -1379,10 +1442,12 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
             spawnSession.markChildStopping(existingSessionId);
           }
           const deadline = Date.now() + 5_000;
-          while (isProcessAlive(pid) && Date.now() < deadline) {
+          // Full-tree termination already proved this generation exited. A
+          // second raw-PID probe can observe an unrelated, newly reused PID.
+          while (!treeTerminationVerified && isProcessAlive(pid) && Date.now() < deadline) {
             await new Promise(resolve => setTimeout(resolve, 50));
           }
-          if (isProcessAlive(pid)) {
+          if (!treeTerminationVerified && isProcessAlive(pid)) {
             logger.debug(`[RUNNER RUN] Session ${sessionId} process ${pid} is still alive after stop request`);
             return 'still_alive';
           }
@@ -1489,14 +1554,14 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           logger.debug(`[RUNNER RUN] Reaped argv-orphan PID(s) for session ${sessionId}`);
           return 'stopped';
         }
-        // No killable orphans: siblings may protect the wrapper, but that is
-        // not proof this root ended. Only an inactive registry binding (Codex
-        // KillSession ack) may claim stopped; otherwise stay unknown on retry.
-        if (sessionRuntimeHasActiveSiblings(liveRuntimes, sessionId) || protectedTrackedPids.size > 0) {
-          const binding = sessionRegistryBindingState(liveRuntimes, sessionId);
+        // An inactive binding confirms KillSession even for the last root,
+        // whose wrapper may still be finishing cleanup after tracking loss.
+        // Sibling protection alone remains insufficient proof of archival.
+        const binding = sessionRegistryBindingState(liveRuntimes, sessionId);
+        if (binding !== 'absent' || sessionRuntimeHasActiveSiblings(liveRuntimes, sessionId) || protectedTrackedPids.size > 0) {
           const decision = decideKeepWrapperArchive(binding);
           logger.debug(
-            `[RUNNER RUN] Session ${sessionId}; shared siblings remain; archive=${decision}`
+            `[RUNNER RUN] Session ${sessionId}; shared binding=${binding}; archive=${decision}`
           );
           return decision === 'still_alive' ? 'still_alive' : decision;
         }
@@ -1519,6 +1584,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
 
     // Handle child process exit
     const onChildExited = (pid: number) => {
+      pidToErrorAwaiter.get(pid)?.(`Session process PID ${pid} exited before startup was confirmed`);
       const session = pidToTrackedSession.get(pid);
       for (const id of Object.keys(session?.sharedSessions ?? {})) rememberVerifiedExit(id);
       const requestedSessionId = session?.requestedHappySessionId ?? pidToRequestedSessionId.get(pid);

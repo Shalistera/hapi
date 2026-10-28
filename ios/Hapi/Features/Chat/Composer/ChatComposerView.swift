@@ -17,6 +17,9 @@ struct ChatComposerView: View {
     let interactor: ChatInteractor
     /// nil ⇒ dictation unavailable (no controller wired) — mic button hidden.
     var dictation: DictationController?
+    /// Folded iPhone Duo: the short outer screen keeps more transcript by
+    /// letting the composer sit closer to the home indicator.
+    var hugsBottomEdge = false
     var onOpenScratchlist: (ScratchlistEntry?, Bool) -> Void = { _, _ in }
 
     // Attachment pickers (the launchers live here; policy + upload live in
@@ -115,7 +118,11 @@ struct ChatComposerView: View {
             .shadow(color: .black.opacity(0.06), radius: 6, y: 2)
         }
         .hapiReadingColumn()
-        .padding(.vertical, 8)
+        .padding(.top, 8)
+        // Overlap the home-indicator safe area only while the software
+        // keyboard is down; above a keyboard the normal gap applies.
+        .padding(.bottom, hugsBottomEdge && !textFocused ? -8 : 8)
+        .animation(.snappy, value: hugsBottomEdge && !textFocused)
         .onChange(of: interactor.composerFocusRequest) {
             textFocused = true
         }

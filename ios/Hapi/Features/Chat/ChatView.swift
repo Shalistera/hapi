@@ -11,6 +11,7 @@ import SwiftUI
 ///
 /// Transcript layout and scroll intent live in `ChatTranscriptView`.
 struct ChatView: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var model: ChatModel
     /// Adaptive session settings (toolbar gear).
     @State private var configOpen = false
@@ -30,6 +31,11 @@ struct ChatView: View {
     /// Kept for the files/viewer pushes (the model owns its own reference).
     private let session: HubSession
     private let sessionId: String
+
+    /// The iPhone Duo outer screen: 678pt tall, so chrome is kept minimal.
+    private var isFoldedOuterScreen: Bool {
+        FoldableDevice.shared.hasHinge && horizontalSizeClass == .compact
+    }
 
     init(
         session: HubSession,
@@ -76,16 +82,31 @@ struct ChatView: View {
             VStack(spacing: 0) {
                 QueuedMessagesBarView(interactor: model.interactor)
                     .hapiReadingColumn()
-                ChatComposerView(interactor: model.interactor, dictation: model.dictation) { entry, editing in
+                ChatComposerView(
+                    interactor: model.interactor,
+                    dictation: model.dictation,
+                    hugsBottomEdge: isFoldedOuterScreen
+                ) { entry, editing in
                     scratchlistEntry = entry
                     scratchlistStartsEditing = editing
                     scratchlistOpen = true
                 }
             }
         }
+        .modifier(FoldedTitleMinimization(isActive: isFoldedOuterScreen))
+        .modifier(FoldedSystemTitle(
+            isActive: isFoldedOuterScreen,
+            title: model.header.title,
+            subtitle: model.header.subtitle
+        ))
         .toolbar {
-            ToolbarItem(placement: .principal) {
-                headerTitle
+            // Folded Duo: Back and the actions live in the side bar, so a
+            // centered title would float right of an empty gap; the system
+            // title (below) sits at the leading margin instead.
+            if !isFoldedOuterScreen {
+                ToolbarItem(placement: .principal) {
+                    headerTitle
+                }
             }
             // Two icons max (device feedback: a crowded trailing edge
             // squeezed the title out): gear for the frequent config
@@ -275,6 +296,43 @@ struct ChatView: View {
             Label("No messages yet", systemImage: "bubble.left.and.bubble.right")
         } description: {
             Text("Messages will appear here as the agent works.")
+        }
+    }
+}
+
+/// Folded iPhone Duo: once the reader scrolls toward newer output, the title
+/// row stays minimized (content reflows into it) until the transcript's top.
+/// The system offers no permanently minimized state.
+private struct FoldedTitleMinimization: ViewModifier {
+    let isActive: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 27.0, *), isActive {
+            content
+                .toolbarMinimizationBehavior(.onScrollDown, for: .navigationBar)
+                .toolbarMinimizationRestoration(.atScrollEdge, for: .navigationBar)
+                .toolbarMinimizationSafeAreaAdjustment(.enabled, for: .navigationBar)
+        } else {
+            content
+        }
+    }
+}
+
+/// Folded iPhone Duo: the system inline title is leading-aligned, unlike the
+/// fixed centered `.principal` slot (a leading item becomes a glass button).
+/// The subtitle is plain text, so the agent icon is omitted here.
+private struct FoldedSystemTitle: ViewModifier {
+    let isActive: Bool
+    let title: String
+    let subtitle: String?
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *), isActive {
+            content
+                .navigationTitle(Text(verbatim: title))
+                .navigationSubtitle(Text(verbatim: subtitle ?? ""))
+        } else {
+            content
         }
     }
 }
