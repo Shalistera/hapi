@@ -22,7 +22,7 @@ import type {
 } from '@/types/api'
 import { queryKeys } from '@/lib/query-keys'
 import { applyAgyCatalogAnnouncement } from '@/lib/agyCatalogAnnouncement'
-import { clearMessageWindow, getMessageWindowState, ingestIncomingMessages, markMessagesConsumed, markMessagesIndeterminate, markMessagesRequeued, removeOptimisticMessage, updateMessageStatus } from '@/lib/message-window-store'
+import { clearMessageWindow, getMessageWindowState, ingestIncomingMessages, markMessagesConsumed, markMessagesIndeterminate, markMessagesDispatching, markMessagesRequeued, removeOptimisticMessage, updateMessageStatus } from '@/lib/message-window-store'
 import { applySessionDetailPatch } from '@/lib/sessionPatch'
 import { compareSessionsByOrderKeyDesc } from '@/lib/sessionOrder'
 
@@ -717,7 +717,9 @@ export function useSSE(options: {
                     markMessagesConsumed(event.sessionId, event.localIds, event.invokedAt, event.steered)
                 }
                 if (event.type === 'messages-indeterminate') {
-                    markMessagesIndeterminate(event.sessionId, event.localIds)
+                    event.dispatching
+                        ? markMessagesDispatching(event.sessionId, event.localIds)
+                        : markMessagesIndeterminate(event.sessionId, event.localIds)
                 }
                 if (event.type === 'messages-requeued') {
                     markMessagesRequeued(event.sessionId, event.localIds)
@@ -734,7 +736,9 @@ export function useSSE(options: {
             }
 
             if (event.type === 'messages-indeterminate') {
-                markMessagesIndeterminate(event.sessionId, event.localIds)
+                event.dispatching
+                        ? markMessagesDispatching(event.sessionId, event.localIds)
+                        : markMessagesIndeterminate(event.sessionId, event.localIds)
             }
 
             if (event.type === 'messages-requeued') {
