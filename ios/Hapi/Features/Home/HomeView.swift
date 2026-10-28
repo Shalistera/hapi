@@ -76,8 +76,13 @@ struct HomeView: View {
             openSession(sessionId)
         }
         .onChange(of: session.sessionRemoval) { _, removal in
-            guard usesSplitNavigation, let removal else { return }
-            tabletNavigation.remove(removal.sessionId)
+            guard let removal else { return }
+            if usesSplitNavigation {
+                tabletNavigation.remove(removal.sessionId)
+            } else if let index = path.firstIndex(of: removal.sessionId) {
+                // Deleted or archived elsewhere: leave the emptied chat.
+                path.removeSubrange(index...)
+            }
         }
         .sheet(isPresented: $model.showAddHub) {
             PairingFlowView(context: .addHub)
@@ -109,6 +114,10 @@ struct HomeView: View {
                 // not an authoritative removal and must not close the chat.
                 set: { if let id = $0 { openSession(id) } }
             ) : nil, onOpenSession: openSession)
+        }
+        .searchable(text: $listModel.searchQuery, prompt: Text("Search sessions"))
+        .onChange(of: tabletNavigation.selectedSessionId, initial: true) { _, sessionId in
+            listModel.selectedSessionId = sessionId
         }
         .navigationTitle("Sessions")
         .navigationBarTitleDisplayMode(.inline)

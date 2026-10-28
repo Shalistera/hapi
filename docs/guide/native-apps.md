@@ -88,8 +88,8 @@ directory browsing and session creation.
 | Capability | Current native behavior |
 |---|---|
 | Chat and permissions | Streaming messages, history, tool inspection, approvals and question answering on both platforms. |
-| Composer | Text, photos/camera/files, drafts, queued-message actions and steering when supported by the session. |
-| Session controls | Both support pin/archive, stopping a turn and sending to resume an inactive session. Android also exposes Rename, Delete and explicit Reopen actions; iOS currently has no corresponding UI for those three actions. |
+| Composer | Text, photos/camera/files, drafts, queued-message actions, `/` command suggestions and steering when supported by the session. |
+| Session controls | Both support pin, rename, stopping a turn and sending to resume an inactive session. Active sessions can be archived; inactive sessions can be reopened explicitly or deleted. |
 | Files and Git | Open **Session files** from the chat menu to browse/search files, inspect Git status and read diffs. |
 | Scratchlist | On iOS, tap the tray beside the composer attachment button to enter **Save draft** mode; Android uses the chat menu. Text and attachments sync within the session. |
 | Dictation | Record audio, transcribe through a configured hub provider, then edit the inserted text before sending. |
@@ -103,9 +103,10 @@ project-pinned sessions, active sessions, pending-request priority among active
 sessions, then `updatedAt` descending. Ties preserve their incoming order. The
 Web sidebar may apply additional directory grouping and client-side search
 ranking; it also exposes text, date-range and unread-only session-list filters.
-The native apps currently provide machine filtering but do not expose those
-Web-only filters. Android and iOS README files describe their platform-specific
-filter presentation and session-row differences.
+Both native apps offer machine filtering and relevance-ranked text search.
+Android adds a date range; iOS adds an unread-only lens and **Mark All as
+Read**. Android and iOS README files describe their platform-specific filter
+presentation and session-row differences.
 
 Selecting an attachment starts its upload after preparation, before you send
 the message or save the Scratchlist entry. Removing it requests cleanup of
@@ -133,10 +134,15 @@ send it automatically. See [Voice input and assistant](./voice-assistant.md).
 ### Features available through the web
 
 Use the web app for the remote terminal, Work Graph, realtime dictation and
-voice assistant, session fork/rewind/export, and the skills picker. These have
-no native UI. Session history actions also depend on the agent's capabilities.
-Native apps display existing scheduled messages but do not provide a form to
-create scheduled sends. Android's full-text file export is a reader action,
+voice assistant, Markdown export, and the skills picker. These have no native
+UI. On iOS, the chat's … menu forks the current conversation, rewinds or forks
+at a user message with a native history point, and exports the session as
+JSON; Android has no fork, rewind or export UI. Session history actions also
+depend on the agent's capabilities.
+Both apps display existing scheduled messages. On iOS, the composer's clock
+schedules a text-only send up to 7 days ahead (relative presets or a specific
+time); Android has no form to create scheduled sends.
+Android's full-text file export is a reader action,
 separate from exporting an entire session.
 
 ## Multiple hubs and sign-out
@@ -171,10 +177,11 @@ FCM delivery uses an unencrypted notification data payload; direct APNs remains
 encrypted. See [Notifications](./notifications.md#native-app-notifications)
 and the [push contract](../api/native-companion-contract.md) for configuration.
 
-Push registration covers every paired hub. Notification taps currently open
-the session against the active hub; if the session cannot be found, switch to
-its owning hub. Background notification actions try paired hubs to resolve
-the session.
+Push registration covers every paired hub. On iOS, a notification tap finds
+the hub that owns the session (active hub first) and switches to it before
+opening the chat. Android opens the session against the active hub; if it
+cannot be found, switch to its owning hub. Background notification actions on
+both platforms try paired hubs to resolve the session.
 
 ## Troubleshooting
 

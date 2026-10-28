@@ -27,6 +27,28 @@ class FakeSocket {
     }
 }
 
+it('does not rebroadcast stored messages and retains repeated consumption acknowledgements', () => {
+    const store = new Store(':memory:')
+    const session = store.sessions.getOrCreateSession('dedupe-replay', {}, null, 'default')
+    const socket = new FakeSocket()
+    const events: SyncEvent[] = []
+    const progress = mock(() => {})
+    registerSessionHandlers(socket as unknown as CliSocketWithData, {
+        store, resolveSessionAccess: () => ({ ok: true, value: session }), emitAccessError() {},
+        onWebappEvent: event => events.push(event), onAgentProgress: progress
+    })
+    const message = { sid: session.id, localId: 'stable-1', message: { role: 'user', content: { type: 'text', text: 'hello' } } }
+    socket.trigger('message', message)
+    socket.trigger('messages-consumed', { sid: session.id, localIds: ['stable-1'] })
+    socket.trigger('message', message)
+    socket.trigger('messages-consumed', { sid: session.id, localIds: ['stable-1'] })
+    expect(events.filter(event => event.type === 'message-received')).toHaveLength(1)
+    expect(events.filter(event => event.type === 'messages-consumed')).toHaveLength(2)
+    expect(progress).toHaveBeenCalledTimes(1)
+    expect(store.messages.getAllMessages(session.id)).toHaveLength(1)
+    store.close()
+})
+
 function redundantGoalStatusContent(message: string): unknown {
     return {
         role: 'agent',
