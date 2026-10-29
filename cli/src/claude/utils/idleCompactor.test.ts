@@ -159,6 +159,15 @@ describe('IdleCompactor', () => {
         expect(compact).not.toHaveBeenCalled()
     })
 
+    it('does not compact again after the launcher reports a /compact', () => {
+        const { compactor, compact } = setup()
+        compactor.onMessage(assistant({ contextTokens: 250_000 }))
+        compactor.onMessage(result)
+        compactor.onCompacted(12_000)
+        vi.advanceTimersByTime(2 * 60 * MINUTE)
+        expect(compact).not.toHaveBeenCalled()
+    })
+
     it('skips the compaction while the session is busy or limited', () => {
         const { compactor, compact } = setup({}, () => false)
         compactor.onMessage(assistant({ contextTokens: 250_000 }))

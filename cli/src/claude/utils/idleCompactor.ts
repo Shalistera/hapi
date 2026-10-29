@@ -105,6 +105,16 @@ export class IdleCompactor {
         }
     }
 
+    /**
+     * A /compact finished: Claude now carries only the summary. Its manual
+     * compact_boundary no longer reaches onMessage, so the launcher reports it.
+     */
+    onCompacted(contextTokens: number | undefined): void {
+        this.clearTimer()
+        this.contextTokens = contextTokens ?? 0
+        this.lastRequestAt = null
+    }
+
     /** User input or a stop: the session is not idle. */
     cancel(): void {
         this.clearTimer()

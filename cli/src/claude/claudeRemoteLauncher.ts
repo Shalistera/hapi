@@ -725,6 +725,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                                 });
                             }
                             if (compactContextTokens !== undefined) {
+                                idleCompactor?.onCompacted(compactContextTokens);
                                 // The status bar keeps the last pre-compaction
                                 // usage until the next model response; refresh
                                 // it with the boundary's post-tokens the same
