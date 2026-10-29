@@ -29,14 +29,17 @@ export function classifySessionAttention(
             : null
     }
 
-    if (summary.active && summary.thinking && !hasManualUnreadMarker(options.manualUnreadAt)) {
-        return null
-    }
-
     // Requests left on an archived session can no longer be answered.
     const pendingRequestKinds = summary.active && Array.isArray(summary.pendingRequestKinds)
         ? summary.pendingRequestKinds
         : []
+
+    // A working session needs attention only while it waits for input, or
+    // when the user marked it unread.
+    if (summary.active && summary.thinking && !hasManualUnreadMarker(options.manualUnreadAt)
+        && !pendingRequestKinds.includes('input')) {
+        return null
+    }
 
     if (pendingRequestKinds.includes('permission')) {
         return { kind: 'permission' }
