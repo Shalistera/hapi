@@ -1020,7 +1020,7 @@ class OpencodeRemoteLauncher extends RemoteLauncherBase {
                     return { steered: false, error: 'Active turn changed' };
                 }
 
-                let steer: { dispatched: Promise<void>; completed: Promise<void> };
+                let steer: { dispatched: Promise<void>; completed: Promise<string | null> };
                 let softSteerOwnership: { backend: AcpSdkBackend; turnEpoch: number } | null = null;
                 try {
                     steer = backend.beginSoftSteerPrompt(acpSessionId, [{
