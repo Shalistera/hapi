@@ -125,6 +125,11 @@ function createClientStub() {
             agentStates.push(agentState)
         },
         emitMessagesConsumed: vi.fn(),
+        // Records which rows were in the waiting queue when each state was sent.
+        steerStates: [] as Array<{ localIds: string[]; state: string; queued: string[] }>,
+        steerStateAck: (_state: string): boolean | Promise<boolean> => true,
+        setSteerDeliveryState: vi.fn(),
+        emitSteerIndeterminate: vi.fn(),
         sendClaudeSessionMessage: () => {},
         sendSessionEvent: () => {},
         notePendingHubPromptEcho: vi.fn(),
@@ -135,6 +140,14 @@ function createClientStub() {
 
 function createSession(client: ReturnType<typeof createClientStub>) {
     const queue = new MessageQueue2<EnhancedMode>((mode) => JSON.stringify(mode))
+    client.setSteerDeliveryState.mockImplementation(async (localIds: string[], state: string) => {
+        client.steerStates.push({
+            localIds,
+            state,
+            queued: queue.queue.flatMap((item) => item.localId ? [item.localId] : [])
+        })
+        return await client.steerStateAck(state)
+    })
     const session = new Session({
         api: {} as any,
         client: client as any,
@@ -202,6 +215,7 @@ describe('claudeRemoteLauncher steer RPC', () => {
 
             expect(await turn.steer('local-2')).toEqual({ steered: true })
 
+            expect(turn.client.steerStates).toEqual([{ localIds: ['local-2'], state: 'dispatching', queued: [] }])
             expect(harness.steered.map((steer) => steer.message)).toEqual(['also check the tests'])
             expect(turn.queue.size()).toBe(0)
             expect(turn.client.notePendingHubPromptEcho).toHaveBeenCalledWith('also check the tests', 'local-2')
@@ -233,8 +247,53 @@ describe('claudeRemoteLauncher steer RPC', () => {
         }
 
         expect(turn.queue.queue.map((item) => item.localId)).toEqual(['local-2', 'local-3', 'local-4'])
+        // Back in its place before the hub hears it is queued again.
+        expect(turn.client.steerStates.at(-1)).toEqual({
+            localIds: ['local-3'],
+            state: 'queued',
+            queued: ['local-2', 'local-3', 'local-4']
+        })
+        expect(turn.client.emitSteerIndeterminate).not.toHaveBeenCalled()
         expect(turn.client.discardPendingHubPromptEcho).toHaveBeenCalledWith('local-3')
         expect(turn.client.emitMessagesConsumed).not.toHaveBeenCalledWith(['local-3'], { steered: true })
+    })
+
+    it('holds the message as unresolved when the hub does not record the dispatch', async () => {
+        const turn = await startTurn()
+        try {
+            turn.queue.push('also check the tests', { permissionMode: 'default' }, 'local-2')
+            turn.client.steerStateAck = () => false
+
+            const response = await turn.steer('local-2')
+
+            expect(response).toEqual({ steered: false, error: 'Steer state is indeterminate' })
+            expect(harness.steered).toEqual([])
+            expect(turn.client.emitSteerIndeterminate).toHaveBeenCalledWith(['local-2'])
+            // Held out of normal delivery until the user retries or cancels it.
+            expect(turn.queue.peekByLocalId('local-2')).toBeNull()
+        } finally {
+            await turn.finish()
+        }
+        expect(turn.queue.size()).toBe(0)
+    })
+
+    it('puts the message back when the turn ends while the hub records the dispatch', async () => {
+        const turn = await startTurn()
+        turn.queue.push('also check the tests', { permissionMode: 'default' }, 'local-2')
+        let ackDispatch!: (ok: boolean) => void
+        turn.client.steerStateAck = (state) => state === 'dispatching'
+            ? new Promise<boolean>((resolve) => { ackDispatch = resolve })
+            : true
+
+        const steering = turn.steer('local-2')
+        await vi.waitFor(() => expect(ackDispatch).toBeDefined())
+        await turn.finish()
+        ackDispatch(true)
+
+        expect(await steering).toEqual({ steered: false, error: 'No active steerable turn' })
+        expect(harness.steered).toEqual([])
+        expect(turn.queue.peekByLocalId('local-2')).not.toBeNull()
+        expect(turn.client.steerStates.map((entry) => entry.state)).toEqual(['dispatching', 'queued'])
     })
 
     it('does not replay the delivered message when Claude fails after its result', async () => {
@@ -260,6 +319,7 @@ describe('claudeRemoteLauncher steer RPC', () => {
             expect(response.error).toMatch(/mode differs/)
             expect(turn.queue.peekByLocalId('local-2')).not.toBeNull()
             expect(harness.steered).toEqual([])
+            expect(turn.client.setSteerDeliveryState).not.toHaveBeenCalled()
         } finally {
             await turn.finish()
         }
@@ -290,6 +350,7 @@ describe('claudeRemoteLauncher steer RPC', () => {
 
             expect(response.steered).toBe(false)
             expect(turn.queue.peekByLocalId('local-2')).not.toBeNull()
+            expect(turn.client.steerStates.map((entry) => entry.state)).toEqual(['dispatching', 'queued'])
             expect(turn.client.emitMessagesConsumed).not.toHaveBeenCalledWith(['local-2'], { steered: true })
         } finally {
             await turn.finish()

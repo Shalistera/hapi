@@ -164,7 +164,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 if (!localId) {
                     return { steered: false, error: 'Missing localId' };
                 }
-                if (!steerTarget) {
+                const target = steerTarget;
+                if (!target) {
                     return { steered: false, error: 'No active steerable turn' };
                 }
                 const taken = session.queue.takeByLocalId(localId);
@@ -176,17 +177,47 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                     session.queue.restoreReservation(taken);
                     return { steered: false, error: 'Slash commands cannot be steered' };
                 }
-                if (taken.item.modeHash !== steerTarget.modeHash) {
+                if (taken.item.modeHash !== target.modeHash) {
                     session.queue.restoreReservation(taken);
                     return { steered: false, error: 'Queued message mode differs from the active turn' };
                 }
                 if (!session.queue.beginReservationDispatch(taken)) {
                     return { steered: false, error: 'Steer cancelled' };
                 }
+                // Claude can take the prompt much later (at its next tool
+                // boundary, or in a follow-up turn), so the hub must know the
+                // row is being delivered rather than still waiting.
+                const dispatchStatePersisted = await session.client.setSteerDeliveryState([localId], 'dispatching');
+                if (!dispatchStatePersisted) {
+                    session.queue.markReservationIndeterminate(taken);
+                    session.client.emitSteerIndeterminate([localId]);
+                    return { steered: false, error: 'Steer state is indeterminate' };
+                }
+                // Put the row back before telling the hub: a turn that ends
+                // while that ack is pending must not run a later message ahead
+                // of it. The hub ignores the late state once the row is invoked.
+                const requeue = (): void => {
+                    if (taken.state !== 'dispatching'
+                        || session.queue.isClosed()
+                        || !session.queue.restoreReservation(taken)
+                        || taken.originIndeterminate) {
+                        session.client.emitSteerIndeterminate([localId]);
+                        return;
+                    }
+                    void session.client.setSteerDeliveryState([localId], 'queued');
+                };
+                if (taken.state !== 'dispatching') {
+                    session.client.emitSteerIndeterminate([localId]);
+                    return { steered: false, error: 'Steer cancelled' };
+                }
+                if (steerTarget !== target) {
+                    requeue();
+                    return { steered: false, error: 'No active steerable turn' };
+                }
                 // The row stays reserved, not consumed, until Claude takes the
                 // prompt: Claude only holds it in memory until then, so an
                 // abort or crash must be able to put it back in the queue.
-                const steered = steerTarget.steer(text, {
+                const steered = target.steer(text, {
                     onStarted: async () => {
                         // Agent output produced before Claude took the prompt
                         // must reach the hub first, or it sorts below it.
@@ -196,13 +227,11 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                     },
                     onDropped: () => {
                         session.client.discardPendingHubPromptEcho(localId);
-                        if (taken.state === 'dispatching' && !session.queue.isClosed()) {
-                            session.queue.restoreReservation(taken);
-                        }
+                        requeue();
                     }
                 });
                 if (!steered) {
-                    session.queue.restoreReservation(taken);
+                    requeue();
                     return { steered: false, error: 'No active steerable turn' };
                 }
                 session.client.notePendingHubPromptEcho(text, localId);
