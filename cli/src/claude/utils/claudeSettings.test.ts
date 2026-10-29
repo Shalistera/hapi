@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readClaudeSettings, resolveClaudeLaunchModel, shouldIncludeCoAuthoredBy } from './claudeSettings';
+import { readClaudeBooleanSetting, readClaudeSettings, resolveClaudeLaunchModel, shouldIncludeCoAuthoredBy } from './claudeSettings';
 
 describe('Claude Settings', () => {
   let testClaudeDir: string;
@@ -128,6 +128,40 @@ describe('Claude Settings', () => {
 
     it('returns null when nothing is configured', () => {
       expect(resolveClaudeLaunchModel({ cwd: join(testClaudeDir, 'missing'), env: { ANTHROPIC_MODEL: '' } })).toBe(null);
+    });
+  });
+
+  describe('readClaudeBooleanSetting', () => {
+    let projectDir: string;
+
+    beforeEach(() => {
+      projectDir = join(testClaudeDir, 'project');
+      mkdirSync(join(projectDir, '.claude'), { recursive: true });
+    });
+
+    it('returns undefined when no layer sets the key', () => {
+      expect(readClaudeBooleanSetting('idleCompaction', projectDir)).toBeUndefined();
+    });
+
+    it('reads the user settings', () => {
+      writeFileSync(join(testClaudeDir, 'settings.json'), JSON.stringify({ idleCompaction: false }));
+      expect(readClaudeBooleanSetting('idleCompaction', projectDir)).toBe(false);
+    });
+
+    it('lets project settings override user settings, and local settings override both', () => {
+      writeFileSync(join(testClaudeDir, 'settings.json'), JSON.stringify({ idleCompaction: false }));
+      writeFileSync(join(projectDir, '.claude', 'settings.json'), JSON.stringify({ idleCompaction: true }));
+      expect(readClaudeBooleanSetting('idleCompaction', projectDir)).toBe(true);
+
+      writeFileSync(join(projectDir, '.claude', 'settings.local.json'), JSON.stringify({ idleCompaction: false }));
+      expect(readClaudeBooleanSetting('idleCompaction', projectDir)).toBe(false);
+    });
+
+    it('skips non-boolean values and unreadable files', () => {
+      writeFileSync(join(projectDir, '.claude', 'settings.local.json'), 'not json');
+      writeFileSync(join(projectDir, '.claude', 'settings.json'), JSON.stringify({ idleCompaction: 'no' }));
+      writeFileSync(join(testClaudeDir, 'settings.json'), JSON.stringify({ idleCompaction: true }));
+      expect(readClaudeBooleanSetting('idleCompaction', projectDir)).toBe(true);
     });
   });
 });
