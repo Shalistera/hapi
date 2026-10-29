@@ -120,6 +120,7 @@ export interface SDKControlResponse extends SDKMessage {
     response: {
         request_id: string
         subtype: 'success' | 'error'
+        response?: unknown
         error?: string
     }
 }
@@ -146,6 +147,11 @@ export interface InterruptRequest extends ControlRequest {
 export interface SetPermissionModeRequest extends ControlRequest {
     subtype: 'set_permission_mode'
     mode: ClaudePermissionMode
+}
+
+export interface GetUsageRequest extends ControlRequest {
+    subtype: 'get_usage'
+    skip_behaviors?: boolean
 }
 
 export interface CanUseToolRequest extends ControlRequest {

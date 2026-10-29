@@ -12,6 +12,7 @@ import { SDKToLogConverter } from "./utils/sdkToLogConverter";
 import { PLAN_FAKE_REJECT } from "./sdk/prompts";
 import { EnhancedMode } from "./loop";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
+import { ClaudeUsageMonitor } from "./utils/claudeUsageMonitor";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import { applySessionTitleFallback, readNativeSessionTitle, stripAttachmentReferences } from './utils/sessionTitleFallback';
@@ -53,6 +54,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     private abortFuture: Future<void> | null = null;
     private permissionHandler: PermissionHandler | null = null;
     private handleSessionFound: ((sessionId: string) => void) | null = null;
+    private usageMonitor: ClaudeUsageMonitor | null = null;
 
     constructor(session: Session) {
         super(process.env.DEBUG ? session.logPath : undefined);
@@ -239,6 +241,15 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             }
         );
 
+        const usageMonitor = new ClaudeUsageMonitor({
+            report: (usage) => session.client.reportClaudeUsage(usage)
+        });
+        this.usageMonitor = usageMonitor;
+        session.client.rpcHandlerManager.registerHandler(
+            RPC_METHODS.RefreshClaudeUsage,
+            () => usageMonitor.refresh()
+        );
+
         const sdkToLogConverter = new SDKToLogConverter({
             sessionId: session.sessionId || 'unknown',
             cwd: session.path,
@@ -258,6 +269,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
         function onMessage(message: SDKMessage) {
             formatClaudeMessageForInk(message, messageBuffer);
             permissionHandler.onMessage(message);
+            usageMonitor.onMessage(message);
 
             if (message.type === 'assistant') {
                 let umessage = message as SDKAssistantMessage;
@@ -588,6 +600,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                             session.consumeOneTimeFlags();
                         },
                         onThinkingChange: session.onThinkingChange,
+                        onUsageReaderChange: (reader) => usageMonitor.setReader(reader),
                         claudeEnvVars: session.claudeEnvVars,
                         claudeArgs: session.claudeArgs,
                         onMessage,
@@ -834,6 +847,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
     protected async cleanup(): Promise<void> {
         this.clearAbortHandlers(this.session.client.rpcHandlerManager);
+        this.usageMonitor?.dispose();
 
         if (this.handleSessionFound) {
             this.session.removeSessionFoundCallback(this.handleSessionFound);

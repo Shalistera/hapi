@@ -31,6 +31,8 @@ import { formatSessionHeaderTimestamp } from '@/lib/sessionHeaderTimestamp'
 import { selectMobileSessionHeaderSecondary } from '@/lib/sessionHeaderMobileMetadata'
 import { useMinuteTick } from '@/hooks/useMinuteTick'
 import { markSessionUnread } from '@/lib/sessionLastSeen'
+import { ClaudeUsageMeter } from '@/components/ClaudeUsageMeter'
+import { selectClaudeUsageForSession } from '@/lib/claudeUsage'
 
 /** Same preference order as session-list chips: display label → host → short id. */
 export function resolveSessionHeaderMachineLabel(
@@ -196,6 +198,11 @@ export function SessionHeader(props: {
     const machineLabel = useMemo(
         () => resolveSessionHeaderMachineLabel(session, machineLabelsById),
         [session, machineLabelsById]
+    )
+    const showClaudeUsage = headerMetadata.claudeUsage && agentFlavor === 'claude'
+    const claudeUsage = useMemo(
+        () => (showClaudeUsage ? selectClaudeUsageForSession(session, machines) : null),
+        [showClaudeUsage, session, machines]
     )
     const lastActiveAt = session.activeAt || session.updatedAt || session.createdAt
     // Relative labels cross minute/hour boundaries without new patches; tick
@@ -469,6 +476,16 @@ export function SessionHeader(props: {
                             ) : null}
                         </div>
                     </div>
+
+                    {showClaudeUsage ? (
+                        <ClaudeUsageMeter
+                            sessionId={session.id}
+                            sessionActive={session.active}
+                            machineId={session.metadata?.machineId ?? null}
+                            usage={claudeUsage}
+                            api={api}
+                        />
+                    ) : null}
 
                     {props.onToggleFiles ? (
                         <button

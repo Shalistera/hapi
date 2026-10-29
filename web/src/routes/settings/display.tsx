@@ -157,6 +157,7 @@ export default function SettingsDisplayPage() {
         { key: 'createdAt', labelKey: 'settings.display.sessionHeader.createdAt' },
         { key: 'updatedAt', labelKey: 'settings.display.sessionHeader.updatedAt' },
         { key: 'worktree', labelKey: 'settings.display.sessionHeader.worktree' },
+        { key: 'claudeUsage', labelKey: 'settings.display.sessionHeader.claudeUsage' },
     ]
 
     return (

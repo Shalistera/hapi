@@ -20,6 +20,7 @@ import {
     type CanUseToolControlRequest,
     type CanUseToolControlResponse,
     type ControlCancelRequest,
+    type GetUsageRequest,
     type PermissionResult,
     AbortError
 } from './types'
@@ -195,9 +196,30 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
     }
 
     /**
+     * Read the structured /usage data (claude.ai plan rate limits). Claude
+     * answers it while a turn is running too.
+     */
+    async getUsage(timeoutMs: number): Promise<unknown> {
+        if (!this.childStdin) {
+            throw new Error('get_usage requires --input-format stream-json')
+        }
+        if (!this.childStdin.writable) {
+            throw new Error('Claude Code process is not accepting input')
+        }
+
+        const request: GetUsageRequest = {
+            subtype: 'get_usage',
+            // Skips the scan of local transcripts; a usage meter only needs the plan limits.
+            skip_behaviors: true
+        }
+        const response = await this.request(request, this.childStdin, timeoutMs)
+        return response.response
+    }
+
+    /**
      * Send control request to Claude process
      */
-    private request(request: ControlRequest, childStdin: Writable): Promise<SDKControlResponse['response']> {
+    private request(request: ControlRequest, childStdin: Writable, timeoutMs?: number): Promise<SDKControlResponse['response']> {
         const requestId = Math.random().toString(36).substring(2, 15)
         const sdkRequest: SDKControlRequest = {
             request_id: requestId,
@@ -206,7 +228,13 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
         }
 
         return new Promise((resolve, reject) => {
+            const timer = timeoutMs === undefined ? null : setTimeout(() => {
+                this.pendingControlResponses.delete(requestId)
+                reject(new Error(`Control request ${request.subtype} timed out`))
+            }, timeoutMs)
             this.pendingControlResponses.set(requestId, (response) => {
+                if (timer) clearTimeout(timer)
+                this.pendingControlResponses.delete(requestId)
                 if (response.subtype === 'success') {
                     resolve(response)
                 } else {

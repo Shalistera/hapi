@@ -2,7 +2,8 @@ import type { ClientToServerEvents } from '@hapi/protocol'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import type { CopilotAgentMode } from '@hapi/protocol'
-import type { AgentState, BackgroundTask, CodexCollaborationMode, Metadata, PermissionMode } from '@hapi/protocol/types'
+import type { AgentState, BackgroundTask, ClaudeUsage, CodexCollaborationMode, Metadata, PermissionMode } from '@hapi/protocol/types'
+import { ClaudeUsageSchema } from '@hapi/protocol/schemas'
 import { getReasoningStreamId, isRedundantGoalStatusEventContent } from '@hapi/protocol/messages'
 import type { Store, StoredSession } from '../../../store'
 import type { SyncEvent } from '../../../sync/syncEngine'
@@ -37,6 +38,12 @@ type SessionEndPayload = {
 type SessionReadyPayload = {
     sid: string
     time: number
+}
+
+export type ClaudeUsagePayload = {
+    machineId: string
+    namespace: string
+    usage: ClaudeUsage
 }
 
 type ResolveSessionAccess = (sessionId: string, opts?: { fresh?: boolean }) => AccessResult<StoredSession>
@@ -105,10 +112,12 @@ export type SessionHandlersDeps = {
     /** Drops the queued-thinking grace so synchronous CLI handlers (e.g. slash
      *  commands) don't leave the spinner stuck for the full grace window. */
     onMessagesConsumed?: (sessionId: string) => void
+    /** Claude plan usage reported by a session, keyed to the session's machine. */
+    onClaudeUsage?: (payload: ClaudeUsagePayload) => void
 }
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
-    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionReady, onSessionEnd, onWebappEvent, onBackgroundTasks, onSessionActivity, onAgentProgress, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionReady, onSessionEnd, onWebappEvent, onBackgroundTasks, onSessionActivity, onAgentProgress, onSweepImmediateQueued, onMessagesConsumed, onClaudeUsage } = deps
 
     socket.on('native-queue-message', data => {
         const parsed = z.object({ sid: z.string(), localId: z.string().min(1), text: z.string().nullable() }).safeParse(data)
@@ -410,6 +419,31 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
         onSessionAlive?.(data)
+    })
+
+    socket.on('claude-usage', (data: { sid: string; usage: unknown }) => {
+        if (!data || typeof data.sid !== 'string') {
+            return
+        }
+        const parsed = ClaudeUsageSchema.safeParse(data.usage)
+        if (!parsed.success) {
+            return
+        }
+        const sessionAccess = resolveSessionAccess(data.sid)
+        if (!sessionAccess.ok) {
+            emitAccessError('session', data.sid, sessionAccess.reason)
+            return
+        }
+        // Usage is account-wide: it belongs to the machine the session runs on,
+        // taken from the hub's own record rather than from the payload.
+        const metadata = sessionAccess.value.metadata
+        const machineId = metadata && typeof metadata === 'object'
+            ? (metadata as { machineId?: unknown }).machineId
+            : undefined
+        if (typeof machineId !== 'string' || machineId.length === 0) {
+            return
+        }
+        onClaudeUsage?.({ machineId, namespace: sessionAccess.value.namespace, usage: parsed.data })
     })
 
     socket.on('session-ready', (data: SessionReadyPayload) => {

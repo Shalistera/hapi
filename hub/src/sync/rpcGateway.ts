@@ -50,6 +50,8 @@ import type {
     WorkspaceGitDiffFileRequest,
     WorkspaceRipgrepRequest
 } from '@hapi/protocol/apiTypes'
+import { RefreshClaudeUsageResponseSchema } from '@hapi/protocol/schemas'
+import type { RefreshClaudeUsageResponse } from '@hapi/protocol/types'
 import type { Server } from 'socket.io'
 import type { RpcRegistry } from '../socket/rpcRegistry'
 
@@ -613,6 +615,16 @@ export class RpcGateway {
             steered: boolean
             error?: string
         }
+    }
+
+    /** Ask the session's Claude process for current plan usage. */
+    async refreshClaudeUsage(sessionId: string): Promise<RefreshClaudeUsageResponse> {
+        const response = await this.sessionRpc(sessionId, RPC_METHODS.RefreshClaudeUsage, {})
+        const parsed = RefreshClaudeUsageResponseSchema.safeParse(response)
+        if (!parsed.success) {
+            throw new Error('Unexpected refresh-claude-usage response')
+        }
+        return parsed.data
     }
 
     async forkConversation(

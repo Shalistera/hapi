@@ -125,6 +125,46 @@ describe('claudeRemote async message handling', () => {
         }
     });
 
+    it('offers a usage reader while the Claude process runs', async () => {
+        const querySpy = vi.spyOn(claudeSdk, 'query').mockImplementation(queryMock as typeof claudeSdk.query);
+        const { claudeRemote } = await import('./claudeRemote');
+        const getUsage = vi.fn(async () => ({ rate_limits_available: true }));
+        queryMock.mockReturnValueOnce(Object.assign(createAsyncStream([
+            { type: 'result', subtype: 'success' } as unknown as SDKMessage
+        ]), { getUsage }));
+        const readers: Array<((timeoutMs: number) => Promise<unknown>) | null> = [];
+
+        let nextCallCount = 0;
+        try {
+            await claudeRemote({
+                sessionId: 'session-1',
+                path: process.cwd(),
+                mcpServers: {},
+                claudeEnvVars: {},
+                claudeArgs: [],
+                allowedTools: [],
+                hookSettingsPath: '/tmp/hook.json',
+                canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+                nextMessage: async () => nextCallCount++ === 0
+                    ? { message: 'hello', mode: { permissionMode: 'default' } }
+                    : null,
+                onReady: () => {},
+                isAborted: () => false,
+                onSessionFound: () => {},
+                onMessage: () => {},
+                onUsageReaderChange: (reader) => readers.push(reader)
+            });
+
+            expect(readers).toHaveLength(2);
+            expect(readers[1]).toBeNull();
+            await expect(readers[0]?.(5_000)).resolves.toEqual({ rate_limits_available: true });
+            expect(getUsage).toHaveBeenCalledWith(5_000);
+        } finally {
+            queryMock.mockReset();
+            querySpy.mockRestore();
+        }
+    });
+
     it('waits for async onReady work before completing the result stream', async () => {
         const querySpy = vi.spyOn(claudeSdk, 'query').mockImplementation(queryMock as typeof claudeSdk.query);
         const { claudeRemote } = await import('./claudeRemote');

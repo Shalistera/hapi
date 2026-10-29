@@ -602,6 +602,32 @@ describe('ApiSessionClient lazy materialization', () => {
     })
 })
 
+describe('ApiSessionClient Claude usage', () => {
+    const usage = {
+        fetchedAt: 1_000,
+        subscriptionType: 'max',
+        limits: [{ kind: 'session', scope: null, percent: 15, resetsAt: null }]
+    }
+
+    it('reports usage and re-sends the last snapshot after reconnecting', () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+        const usageEmits = () => socket.emitted.filter((entry) => entry.event === 'claude-usage')
+
+        client.reportClaudeUsage(usage)
+        expect(usageEmits()).toEqual([
+            { event: 'claude-usage', args: [{ sid: '11111111-1111-4111-8111-111111111111', usage }] }
+        ])
+
+        socket.triggerConnect()
+        expect(usageEmits()).toHaveLength(2)
+        expect(usageEmits()[1]?.args[0]).toEqual({ sid: '11111111-1111-4111-8111-111111111111', usage })
+        client.close()
+    })
+})
+
 describe('ApiSessionClient agy transcript messages', () => {
     it('renders only the USER_REQUEST body, not the sections agy appends', () => {
         socketHarness.sockets.length = 0

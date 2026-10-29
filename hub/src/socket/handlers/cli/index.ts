@@ -7,7 +7,7 @@ import type { CliSocketWithData, SocketServer } from '../../socketTypes'
 import type { AccessErrorReason, AccessResult } from './types'
 import { registerMachineHandlers } from './machineHandlers'
 import { registerRpcHandlers } from './rpcHandlers'
-import { registerSessionHandlers } from './sessionHandlers'
+import { registerSessionHandlers, type ClaudeUsagePayload } from './sessionHandlers'
 import { cleanupTerminalHandlers, registerTerminalHandlers } from './terminalHandlers'
 import { sessionDeletionEpoch } from '../../../store/sessionInvalidation'
 
@@ -53,6 +53,7 @@ export type CliHandlersDeps = {
     onAgentProgress?: (sessionId: string, at: number) => void
     onSweepImmediateQueued?: (sessionId: string, now: number) => void
     onMessagesConsumed?: (sessionId: string) => void
+    onClaudeUsage?: (payload: ClaudeUsagePayload) => void
 }
 
 // resolveSessionAccess runs on EVERY cli socket event (message stream deltas,
@@ -84,7 +85,7 @@ const SESSION_ACCESS_CACHE_TTL_MS = 1_000
 const SESSION_ACCESS_CACHE_MAX_SESSIONS = 64
 
 export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlersDeps): void {
-    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionReady, onSessionEnd, onMachineAlive, onWebappEvent, onBackgroundTasks, onSessionActivity, onAgentProgress, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionReady, onSessionEnd, onMachineAlive, onWebappEvent, onBackgroundTasks, onSessionActivity, onAgentProgress, onSweepImmediateQueued, onMessagesConsumed, onClaudeUsage } = deps
     const terminalNamespace = io.of('/terminal')
     const namespace = typeof socket.data.namespace === 'string' ? socket.data.namespace : null
 
@@ -182,7 +183,8 @@ export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlers
         onSessionActivity,
         onAgentProgress,
         onSweepImmediateQueued,
-        onMessagesConsumed
+        onMessagesConsumed,
+        onClaudeUsage
     })
     registerMachineHandlers(socket, {
         store,

@@ -1,4 +1,4 @@
-import type { Machine, MachinePatch } from '@hapi/protocol/types'
+import type { ClaudeUsage, Machine, MachinePatch } from '@hapi/protocol/types'
 import { MachineHealthSchema, MachineMetadataSchema, RunnerStateSchema } from '@hapi/protocol/schemas'
 import type { Store } from '../store'
 import { clampAliveTime } from './aliveTime'
@@ -180,7 +180,8 @@ export class MachineCache {
             metadataVersion: stored.metadataVersion,
             runnerState,
             runnerStateVersion: stored.runnerStateVersion,
-            health: existing?.health ?? null
+            health: existing?.health ?? null,
+            claudeUsage: existing?.claudeUsage ?? null
         }
 
         this.machines.set(machineId, machine)
@@ -221,6 +222,20 @@ export class MachineCache {
             this.lastBroadcastAtByMachineId.set(machine.id, now)
             this.publisher.emit({ type: 'machine-updated', machineId: machine.id, data: machine })
         }
+    }
+
+    /**
+     * Claude plan usage is account-wide, so any Claude session on the machine
+     * may report it. Older snapshots (e.g. re-sent after a reconnect) never
+     * replace a newer one.
+     */
+    handleClaudeUsage(machineId: string, namespace: string, usage: ClaudeUsage): void {
+        const machine = this.machines.get(machineId) ?? this.refreshMachine(machineId)
+        if (!machine || machine.namespace !== namespace) return
+        if (machine.claudeUsage && machine.claudeUsage.fetchedAt >= usage.fetchedAt) return
+
+        machine.claudeUsage = usage
+        this.publisher.emit({ type: 'machine-updated', machineId: machine.id, data: machine })
     }
 
     expireInactive(now: number = Date.now()): void {

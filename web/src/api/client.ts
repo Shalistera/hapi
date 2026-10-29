@@ -20,6 +20,7 @@ import type {
     PiImportSessionsResponse,
     PiLocalSessionsResponse,
     PushSubscriptionPayload,
+    RefreshClaudeUsageResponse,
     PushUnsubscribePayload,
     PushVapidPublicKeyResponse,
     SlashCommandsResponse,
@@ -1044,6 +1045,13 @@ export class ApiClient {
     async getSlashCommands(sessionId: string): Promise<SlashCommandsResponse> {
         return await this.request<SlashCommandsResponse>(
             `/api/sessions/${encodeURIComponent(sessionId)}/slash-commands`
+        )
+    }
+
+    async refreshClaudeUsage(sessionId: string): Promise<RefreshClaudeUsageResponse> {
+        return await this.request<RefreshClaudeUsageResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/claude-usage/refresh`,
+            { method: 'POST', body: JSON.stringify({}) }
         )
     }
 

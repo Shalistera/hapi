@@ -35,6 +35,7 @@ import type { WebAppEnv } from '../middleware/auth'
 import { loadScratchlistAttachmentLimitsFromEnv } from '../../config/scratchlistAttachmentLimits'
 import { validateScratchlistAttachmentsForWrite, scratchlistSessionBytesBeforeForPut } from '../../scratchlistAttachments/validate'
 import { TitleSuggestionError } from '../../sync/titleSuggestion'
+import type { RefreshClaudeUsageResponse } from '@hapi/protocol/types'
 import { requireSessionFromParam, requireSyncEngine } from './guards'
 
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -1372,6 +1373,33 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                 success: false,
                 error: error instanceof Error ? error.message : 'Failed to list skills'
             })
+        }
+    })
+
+    app.post('/sessions/:id/claude-usage/refresh', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        if ((sessionResult.session.metadata?.flavor ?? 'claude') !== 'claude') {
+            return c.json({ error: 'Claude usage is only available for Claude sessions' }, 400)
+        }
+
+        try {
+            return c.json(await engine.refreshClaudeUsage(sessionResult.sessionId))
+        } catch (error) {
+            if (error instanceof RpcTargetMissingError) {
+                return c.json({ status: 'not-running' } satisfies RefreshClaudeUsageResponse)
+            }
+            return c.json({
+                error: error instanceof Error ? error.message : 'Failed to refresh Claude usage'
+            }, 502)
         }
     })
 

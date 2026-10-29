@@ -89,6 +89,36 @@ describe('cli session handlers', () => {
         expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ localId: 'pending', invokedAt: null })
         store.close()
     })
+    it('forwards valid Claude usage to the session machine', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('claude-usage', { path: '/repo', host: 'box', flavor: 'claude', machineId: 'machine-1' }, null, 'default')
+        const socket = new FakeSocket(); const onClaudeUsage = mock()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store, resolveSessionAccess: () => ({ ok: true, value: session }), emitAccessError() {}, onClaudeUsage
+        })
+        const usage = { fetchedAt: 1_000, subscriptionType: 'max', limits: [{ kind: 'session', scope: null, percent: 15, resetsAt: 2_000, severity: 'normal' }] }
+
+        socket.trigger('claude-usage', { sid: session.id, usage })
+        socket.trigger('claude-usage', { sid: session.id, usage: { fetchedAt: 1_000, limits: [{ kind: 'session', percent: -1, resetsAt: null }] } })
+        socket.trigger('claude-usage', { sid: session.id, usage: 'nope' })
+
+        expect(onClaudeUsage).toHaveBeenCalledTimes(1)
+        expect(onClaudeUsage).toHaveBeenCalledWith({ machineId: 'machine-1', namespace: 'default', usage })
+        store.close()
+    })
+    it('ignores Claude usage from a session with no machine', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('claude-usage-orphan', { path: '/repo', host: 'box', flavor: 'claude' }, null, 'default')
+        const socket = new FakeSocket(); const onClaudeUsage = mock()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store, resolveSessionAccess: () => ({ ok: true, value: session }), emitAccessError() {}, onClaudeUsage
+        })
+
+        socket.trigger('claude-usage', { sid: session.id, usage: { fetchedAt: 1_000, limits: [] } })
+
+        expect(onClaudeUsage).not.toHaveBeenCalled()
+        store.close()
+    })
     it('mirrors native queued edits/removal without overwriting or deleting a consumed row', () => {
         const store = new Store(':memory:')
         const session = store.sessions.getOrCreateSession('shared-queue', { capabilities: { concurrentClients: true } }, null, 'default')

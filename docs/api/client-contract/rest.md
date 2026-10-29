@@ -65,6 +65,7 @@ Source: `hub/src/web/routes/sessions.ts`; request schemas in `shared/src/apiType
 | `POST /api/sessions/:id/title-suggestion` | — | `{title}`; errors pass through 422/429/502/503 |
 | `GET /api/sessions/:id/slash-commands` | — | `SlashCommandsResponse` `{success, commands?, error?}` |
 | `GET /api/sessions/:id/skills` | — | `SkillsResponse`-shaped `{success, ...}` |
+| `POST /api/sessions/:id/claude-usage/refresh` | `{}` | `RefreshClaudeUsageResponse` `{status: 'ok', usage} \| {status: 'not-running' \| 'unavailable' \| 'failed'}` — active Claude sessions only; on `ok` the session's machine also receives the snapshot as `Machine.claudeUsage` |
 
 ::: warning resume / reopen may return a different sessionId
 Both endpoints return the id of the session that now carries the conversation — which **may differ from the id you called them on** (fresh spawn under a new id; the old row is superseded). Clients must migrate composer drafts and replace navigation to the returned id. Reference: `web/src/routes/sessions/followSupersedingSession.ts`; the durable link also appears as `metadata.supersededBySessionId` on the old session.
@@ -157,7 +158,7 @@ Source: `hub/src/web/routes/machines.ts`; schemas `SpawnSessionRequestSchema`, `
 
 | Method & path | Request | Response |
 |---|---|---|
-| `GET /api/machines` | — | `{machines: Machine[]}` (online machines in the caller's namespace) |
+| `GET /api/machines` | — | `{machines: Machine[]}` (online machines in the caller's namespace). Optional `claudeUsage: ClaudeUsage \| null` is the latest Claude plan usage any Claude session on the machine reported (hub memory only) |
 | `PATCH /api/machines/:id` | `{displayName}` (trimmed; ≤ 64 chars; empty clears back to hostname) | `{ok: true}` |
 | `GET /api/machines/:id/agent-availability` | — | `{agents: {agent, available, reason?: 'not_found'\|'invalid_configuration'}[]}`; 409 `runner_upgrade_required` on old runners |
 | `POST /api/machines/:id/spawn` | `{directory, agent?, model?, effort?, modelReasoningEffort?, yolo?, permissionMode?, sessionType?: 'simple'\|'worktree', worktreeName?, serviceTier?, collaborationMode?, copilotAgentMode?, startingMode?: 'remote'\|'pty'}` | `{type: 'success', sessionId}` \| `{type: 'error', message, code?, agent?}` (agy accepts only `remote`) |

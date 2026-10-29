@@ -12,6 +12,7 @@ import { RpcRegistry } from './rpcRegistry'
 import { SOCKET_MAX_HTTP_BUFFER_SIZE } from './socketLimits'
 import type { BackgroundTask } from '@hapi/protocol/types'
 import type { SyncEvent } from '../sync/syncEngine'
+import type { ClaudeUsagePayload } from './handlers/cli/sessionHandlers'
 import { TerminalRegistry } from './terminalRegistry'
 import { clearUserTerminalBuffer } from './userTerminalBuffer'
 import type { CliSocketWithData, SocketData, SocketServer } from './socketTypes'
@@ -48,6 +49,7 @@ export type SocketServerDeps = {
     onAgentProgress?: (sessionId: string, at: number) => void
     onSweepImmediateQueued?: (sessionId: string, now: number) => void
     onMessagesConsumed?: (sessionId: string) => void
+    onClaudeUsage?: (payload: ClaudeUsagePayload) => void
 }
 
 export function createSocketServer(deps: SocketServerDeps): {
@@ -136,7 +138,8 @@ export function createSocketServer(deps: SocketServerDeps): {
         onSessionActivity: deps.onSessionActivity,
         onAgentProgress: deps.onAgentProgress,
         onSweepImmediateQueued: deps.onSweepImmediateQueued,
-        onMessagesConsumed: deps.onMessagesConsumed
+        onMessagesConsumed: deps.onMessagesConsumed,
+        onClaudeUsage: deps.onClaudeUsage
     }))
 
     terminalNs.use(async (socket, next) => {
